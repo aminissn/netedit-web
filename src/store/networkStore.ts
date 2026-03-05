@@ -115,6 +115,12 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
     });
   }
 
+  function recomputeAndRebuild(network: SUMONetwork): void {
+    // Keep the editor loop aligned with netedit/netconvert: mutate -> recompute -> render.
+    computeNetwork(network);
+    rebuildRenderable();
+  }
+
   return {
     network: null,
     renderable: null,
@@ -161,7 +167,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return null;
       pushHistory();
       const j = addJunction(network, x, y, type);
-      rebuildRenderable();
+      recomputeAndRebuild(network);
       return j.id;
     },
 
@@ -170,7 +176,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       moveJunction(network, id, x, y);
-      rebuildRenderable();
+      recomputeAndRebuild(network);
     },
 
     doRemoveJunction: (id) => {
@@ -178,7 +184,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       removeJunction(network, id);
-      rebuildRenderable();
+      recomputeAndRebuild(network);
     },
 
     doAddEdge: (fromId, toId) => {
@@ -186,7 +192,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return null;
       pushHistory();
       const edge = addEdge(network, fromId, toId);
-      rebuildRenderable();
+      recomputeAndRebuild(network);
       return edge?.id ?? null;
     },
 
@@ -195,7 +201,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       removeEdge(network, id);
-      rebuildRenderable();
+      recomputeAndRebuild(network);
     },
 
     doSetEdgeAttribute: (id, attr, value) => {
@@ -203,7 +209,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       setEdgeAttribute(network, id, attr, value);
-      rebuildRenderable();
+      recomputeAndRebuild(network);
     },
 
     doMoveGeometryPoint: (edgeId, pointIndex, pos) => {
@@ -211,7 +217,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       moveEdgeGeometryPoint(network, edgeId, pointIndex, pos);
-      rebuildRenderable();
+      recomputeAndRebuild(network);
     },
 
     doAddGeometryPoint: (edgeId, afterIndex, pos) => {
@@ -219,7 +225,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       addEdgeGeometryPoint(network, edgeId, afterIndex, pos);
-      rebuildRenderable();
+      recomputeAndRebuild(network);
     },
 
     doRemoveGeometryPoint: (edgeId, pointIndex) => {
@@ -227,7 +233,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       removeEdgeGeometryPoint(network, edgeId, pointIndex);
-      rebuildRenderable();
+      recomputeAndRebuild(network);
     },
 
     doAddConnection: (from, to, fromLane, toLane) => {
@@ -282,15 +288,14 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         }
       }
 
-      rebuildRenderable();
+      recomputeAndRebuild(network);
     },
 
     doComputeNetwork: () => {
       const { network } = get();
       if (!network) return;
       pushHistory();
-      computeNetwork(network);
-      rebuildRenderable();
+      recomputeAndRebuild(network);
     },
 
     undo: () => {

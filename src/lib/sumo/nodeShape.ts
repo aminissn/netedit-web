@@ -5,7 +5,7 @@
  * lane boundaries to get the junction polygon vertices. Edges are also trimmed
  * (setback) so they stop at the junction boundary instead of its center.
  */
-import type { SUMOJunction, SUMOEdge, XY, SpreadType } from "./types";
+import type { SUMOJunction, SUMOEdge, XY } from "./types";
 import {
   add,
   sub,
@@ -17,6 +17,7 @@ import {
   lineIntersection,
   dist,
   convexHull,
+  dot,
 } from "./geometry";
 
 const DEFAULT_RADIUS = 1.5;
@@ -244,38 +245,31 @@ function pushEdgeEnd(
   dir: XY,
   nodePos: XY
 ): void {
-  const laneWidth = edge.width || SUMO_DEFAULT_LANE_WIDTH;
-  const totalWidth = edge.numLanes * laneWidth;
-
+  const defaultLaneWidth = edge.width || SUMO_DEFAULT_LANE_WIDTH;
+  const totalWidth = edge.numLanes * defaultLaneWidth;
   // perpRight gives the rightward normal when looking along dir (Y-up system)
   const right = perpRight(dir);
+  let minRightCoord = Number.POSITIVE_INFINITY;
+  let maxRightCoord = Number.NEGATIVE_INFINITY;
 
-  // Compute boundary offsets based on spread type.
-  // "right looking away" = CCW boundary, "left looking away" = CW boundary
-  let rightOffset: number; // distance to the right of centerline
-  let leftOffset: number;  // distance to the left of centerline (positive = left)
-
-  if (edge.spreadType === "right") {
-    // With spreadType "right", lanes are offset to the LEFT of centerline
-    // (computeLaneShape uses negative offsets: -(laneIndex+0.5)*laneWidth)
-    // For incoming edges, local direction at the node is reversed, so the
-    // occupied side flips and boundary offsets must be swapped.
-    if (isIncoming) {
-      rightOffset = totalWidth;
-      leftOffset = 0;
-    } else {
-      rightOffset = 0;
-      leftOffset = totalWidth;
-    }
-  } else {
-    // "center" and "roadCenter": lanes spread symmetrically
-    rightOffset = totalWidth / 2;
-    leftOffset = totalWidth / 2;
+  for (const lane of edge.lanes) {
+    if (lane.shape.length < 1) continue;
+    const centerAtNode = isIncoming ? lane.shape[lane.shape.length - 1] : lane.shape[0];
+    const centerCoord = dot(sub(centerAtNode, nodePos), right);
+    const halfLaneWidth = (lane.width || defaultLaneWidth) / 2;
+    minRightCoord = Math.min(minRightCoord, centerCoord - halfLaneWidth);
+    maxRightCoord = Math.max(maxRightCoord, centerCoord + halfLaneWidth);
   }
 
-  const ccwBoundary = add(nodePos, scale(right, rightOffset));
-  const cwBoundary  = add(nodePos, scale(right, -leftOffset));
-  const halfWidth = totalWidth / 2;
+  // Fall back to a simple centered span if lane geometry is not available.
+  if (!Number.isFinite(minRightCoord) || !Number.isFinite(maxRightCoord)) {
+    minRightCoord = -totalWidth / 2;
+    maxRightCoord = totalWidth / 2;
+  }
+
+  const ccwBoundary = add(nodePos, scale(right, maxRightCoord));
+  const cwBoundary = add(nodePos, scale(right, minRightCoord));
+  const halfWidth = Math.max(0.5, (maxRightCoord - minRightCoord) / 2);
 
   out.push({
     edge,
@@ -346,9 +340,14 @@ export function trimEdgeAtJunctions(
 
 export function computeSetback(
   junction: SUMOJunction,
-  _edge: SUMOEdge,
+  edge: SUMOEdge,
   allEdges: Map<string, SUMOEdge>
 ): number {
+  const geometricSetback = computeSetbackFromJunctionShape(junction, edge);
+  if (geometricSetback !== null) {
+    return geometricSetback;
+  }
+
   let maxHalfWidth = 0;
   let edgeCount = 0;
   allEdges.forEach((e) => {
@@ -363,6 +362,55 @@ export function computeSetback(
 
   // Setback = roughly the half-width of the widest road + a bit
   return Math.max(MIN_SETBACK, maxHalfWidth + 1);
+}
+
+function computeSetbackFromJunctionShape(junction: SUMOJunction, edge: SUMOEdge): number | null {
+  if (junction.shape.length < 3 || edge.shape.length < 2) return null;
+  if (edge.from !== junction.id && edge.to !== junction.id) return null;
+
+  const oriented = edge.from === junction.id ? edge.shape : [...edge.shape].reverse();
+  const polygon = junction.shape;
+  const epsilon = 1e-6;
+  let traveled = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (let i = 0; i < oriented.length - 1; i++) {
+    const segmentStart = oriented[i];
+    const segmentEnd = oriented[i + 1];
+    const segmentLength = dist(segmentStart, segmentEnd);
+    if (segmentLength < epsilon) continue;
+
+    for (let j = 0; j < polygon.length; j++) {
+      const boundaryStart = polygon[j];
+      const boundaryEnd = polygon[(j + 1) % polygon.length];
+      const t = segmentIntersectionParam(segmentStart, segmentEnd, boundaryStart, boundaryEnd);
+      if (t === null || t < -epsilon || t > 1 + epsilon) continue;
+
+      const clampedT = Math.max(0, Math.min(1, t));
+      const intersectionDistance = traveled + clampedT * segmentLength;
+      if (intersectionDistance > epsilon) {
+        bestDistance = Math.min(bestDistance, intersectionDistance);
+      }
+    }
+    traveled += segmentLength;
+  }
+
+  return Number.isFinite(bestDistance) ? Math.max(0, bestDistance) : null;
+}
+
+function segmentIntersectionParam(a: XY, b: XY, c: XY, d: XY): number | null {
+  const r = sub(b, a);
+  const s = sub(d, c);
+  const denom = r[0] * s[1] - r[1] * s[0];
+  const qMinusP = sub(c, a);
+  const epsilon = 1e-10;
+
+  if (Math.abs(denom) < epsilon) return null;
+
+  const t = (qMinusP[0] * s[1] - qMinusP[1] * s[0]) / denom;
+  const u = (qMinusP[0] * r[1] - qMinusP[1] * r[0]) / denom;
+  if (u < -1e-8 || u > 1 + 1e-8) return null;
+  return t;
 }
 
 export function trimPolylineStart(shape: XY[], amount: number): XY[] {
