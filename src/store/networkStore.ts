@@ -167,7 +167,9 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return null;
       pushHistory();
       const j = addJunction(network, x, y, type);
-      recomputeAndRebuild(network);
+      // Adding an isolated junction should not trigger a full-network recompute,
+      // otherwise all imported junction polygons get recomputed and may drift.
+      rebuildRenderable();
       return j.id;
     },
 
@@ -192,7 +194,9 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return null;
       pushHistory();
       const edge = addEdge(network, fromId, toId);
-      recomputeAndRebuild(network);
+      // Keep imported junction polygons stable: edge creation already updates
+      // the new edge and its endpoint junction geometry locally.
+      rebuildRenderable();
       return edge?.id ?? null;
     },
 
