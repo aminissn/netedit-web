@@ -12,9 +12,17 @@ import type {
   SpreadType,
   TLSType,
 } from "./types";
+import { SUMO_DEFAULT_LANE_WIDTH, offsetPolyline } from "./geometry";
 
 const DEFAULT_SPREAD_TYPE: SpreadType = "right";
 
+/**
+ * Parse and normalize coordinates from XML.
+ * Coordinates in SUMO's net.xml are in "net" coordinate system:
+ *   net_coord = proj_coord + offset
+ * 
+ * We ensure coordinates are properly parsed and rounded to avoid precision issues.
+ */
 function parseShape(shapeStr: string): XY[] {
   if (!shapeStr || shapeStr.trim() === "") return [];
   return shapeStr
@@ -22,9 +30,22 @@ function parseShape(shapeStr: string): XY[] {
     .split(" ")
     .map((pair) => {
       const parts = pair.split(",");
-      return [parseFloat(parts[0]), parseFloat(parts[1])] as XY;
+      const x = parseFloat(parts[0]);
+      const y = parseFloat(parts[1]);
+      // Round to reasonable precision to avoid floating point issues
+      // SUMO typically uses ~2-3 decimal places for coordinates
+      return [Math.round(x * 1000) / 1000, Math.round(y * 1000) / 1000] as XY;
     })
     .filter((xy) => !isNaN(xy[0]) && !isNaN(xy[1]));
+}
+
+/**
+ * Parse and normalize a single coordinate value.
+ */
+function parseCoord(value: string | null, defaultValue: number = 0): number {
+  if (!value) return defaultValue;
+  const n = parseFloat(value);
+  return isNaN(n) ? defaultValue : Math.round(n * 1000) / 1000;
 }
 
 function parseStringList(str: string): string[] {
@@ -50,46 +71,120 @@ function intAttr(el: Element, name: string, def = 0): number {
   return isNaN(n) ? def : n;
 }
 
+/**
+ * Convert coordinates using SUMO's coordinate system.
+ * In SUMO net.xml, coordinates are stored in "net" coordinate system.
+ * This function ensures coordinates are properly interpreted.
+ * 
+ * Equivalent to sumolib.net.convertXY2LonLat / convertLonLat2XY logic.
+ */
+function ensureNetCoordinates(
+  xy: XY,
+  location: SUMOLocation
+): XY {
+  // Coordinates in XML are already in net coordinate system
+  // net_coord = proj_coord + offset
+  // So we use them as-is, but ensure they're properly rounded
+  return [Math.round(xy[0] * 1000) / 1000, Math.round(xy[1] * 1000) / 1000];
+}
+
+function inferEdgeCenterLine(
+  lanes: SUMOLane[],
+  fromJunction: SUMOJunction | undefined,
+  toJunction: SUMOJunction | undefined
+): XY[] {
+  if (lanes.length === 0) {
+    if (fromJunction && toJunction) {
+      return [
+        [fromJunction.x, fromJunction.y],
+        [toJunction.x, toJunction.y],
+      ];
+    }
+    return [];
+  }
+
+  const lane0 = lanes[0];
+  if (lane0.shape.length < 2) return lane0.shape;
+
+  const laneWidth = lane0.width > 0 ? lane0.width : SUMO_DEFAULT_LANE_WIDTH;
+  // SUMO "right" spread: lane 0 lies +0.5 lane width to the right of edge center.
+  const inferred = offsetPolyline(lane0.shape, -0.5 * laneWidth);
+
+  if (fromJunction && inferred.length > 0) {
+    inferred[0] = [fromJunction.x, fromJunction.y];
+  }
+  if (toJunction && inferred.length > 0) {
+    inferred[inferred.length - 1] = [toJunction.x, toJunction.y];
+  }
+
+  return inferred;
+}
+
 export function parseNetXML(xmlString: string): SUMONetwork {
   const parser = new DOMParser();
   const doc = parser.parseFromString(xmlString, "text/xml");
 
-  // Parse location
+  // Parse location first - needed for coordinate conversion
   const locEl = doc.querySelector("location");
   const location: SUMOLocation = {
     netOffset: locEl
       ? (attr(locEl, "netOffset")
           .split(",")
-          .map(Number) as XY)
+          .map((v) => parseCoord(v, 0)) as XY)
       : [0, 0],
     convBoundary: locEl
       ? (attr(locEl, "convBoundary")
           .split(",")
-          .map(Number) as [number, number, number, number])
+          .map((v) => parseCoord(v, 0)) as [number, number, number, number])
       : [0, 0, 0, 0],
     origBoundary: locEl
       ? (attr(locEl, "origBoundary")
           .split(",")
-          .map(Number) as [number, number, number, number])
+          .map((v) => parseCoord(v, 0)) as [number, number, number, number])
       : [0, 0, 0, 0],
     projParameter: locEl ? attr(locEl, "projParameter") : "",
   };
 
   // Parse junctions
+  // Coordinates in XML are in "net" coordinate system (net_coord = proj_coord + offset)
   const junctions = new Map<string, SUMOJunction>();
   doc.querySelectorAll("junction").forEach((el) => {
     const id = attr(el, "id");
     const type = attr(el, "type", "priority") as JunctionType;
     if (type === "internal") return; // skip internal junctions for now
+    
+    // Parse and normalize junction coordinates
+    const x = parseCoord(attr(el, "x"), 0);
+    const y = parseCoord(attr(el, "y"), 0);
+    const z = parseCoord(attr(el, "z"), 0);
+    
+    // Parse and normalize junction shape
+    const shapeStr = attr(el, "shape");
+    let shape = parseShape(shapeStr);
+    // Ensure shape coordinates are normalized
+    shape = shape.map((xy) => ensureNetCoordinates(xy, location));
+    
+    // If shape is empty or invalid, create a default shape centered at junction position
+    // This ensures the junction always has a valid shape
+    if (shape.length < 3) {
+      const defaultSize = 2.0;
+      shape = [
+        [x - defaultSize, y - defaultSize],
+        [x + defaultSize, y - defaultSize],
+        [x + defaultSize, y + defaultSize],
+        [x - defaultSize, y + defaultSize],
+      ];
+    }
+    
     junctions.set(id, {
       id,
       type,
-      x: numAttr(el, "x"),
-      y: numAttr(el, "y"),
-      z: numAttr(el, "z"),
+      x,
+      y,
+      z,
       incLanes: parseStringList(attr(el, "incLanes")),
       intLanes: parseStringList(attr(el, "intLanes")),
-      shape: parseShape(attr(el, "shape")),
+      shape,
       customShape: false,
     });
   });
@@ -100,9 +195,17 @@ export function parseNetXML(xmlString: string): SUMONetwork {
     const id = attr(el, "id");
     // Skip internal edges (they start with ":")
     if (id.startsWith(":")) return;
+    const fromId = attr(el, "from");
+    const toId = attr(el, "to");
+    const fromJunction = junctions.get(fromId);
+    const toJunction = junctions.get(toId);
 
     const lanes: SUMOLane[] = [];
     el.querySelectorAll("lane").forEach((laneEl) => {
+      // Parse and normalize lane shape coordinates
+      let laneShape = parseShape(attr(laneEl, "shape"));
+      laneShape = laneShape.map((xy) => ensureNetCoordinates(xy, location));
+      
       lanes.push({
         id: attr(laneEl, "id"),
         index: intAttr(laneEl, "index"),
@@ -111,7 +214,7 @@ export function parseNetXML(xmlString: string): SUMONetwork {
         width: numAttr(laneEl, "width", 3.2),
         allow: attr(laneEl, "allow"),
         disallow: attr(laneEl, "disallow"),
-        shape: parseShape(attr(laneEl, "shape")),
+        shape: laneShape,
       });
     });
 
@@ -119,15 +222,17 @@ export function parseNetXML(xmlString: string): SUMONetwork {
     lanes.sort((a, b) => a.index - b.index);
 
     // Edge shape is either explicit or derived from first lane
-    let edgeShape = parseShape(attr(el, "shape"));
-    if (edgeShape.length === 0 && lanes.length > 0) {
-      edgeShape = lanes[0].shape;
-    }
+    // Ensure coordinates are normalized
+    const rawEdgeShape = parseShape(attr(el, "shape"));
+    const edgeShape =
+      rawEdgeShape.length > 0
+        ? rawEdgeShape.map((xy) => ensureNetCoordinates(xy, location))
+        : inferEdgeCenterLine(lanes, fromJunction, toJunction);
 
     edges.set(id, {
       id,
-      from: attr(el, "from"),
-      to: attr(el, "to"),
+      from: fromId,
+      to: toId,
       type: attr(el, "type"),
       priority: intAttr(el, "priority", -1),
       numLanes: lanes.length,

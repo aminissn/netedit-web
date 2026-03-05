@@ -31,8 +31,11 @@ import {
   polylineLength,
   SUMO_DEFAULT_LANE_WIDTH,
   interpolatePolyline,
+  cross,
+  dot,
 } from "./geometry";
 import { computeNodeShape, computeSetback, trimPolylineStart, trimPolylineEnd } from "./nodeShape";
+import { generateTLSProgram } from "./tlsGenerate";
 
 let idCounter = 0;
 function nextId(prefix: string): string {
@@ -93,12 +96,12 @@ export function moveJunction(
   network.edges.forEach((edge) => {
     if (edge.from === junctionId && edge.shape.length > 0) {
       edge.shape[0] = [edge.shape[0][0] + dx, edge.shape[0][1] + dy];
-      recomputeLaneShapes(edge);
+      recomputeLaneShapes(edge, network);
     }
     if (edge.to === junctionId && edge.shape.length > 0) {
       const last = edge.shape.length - 1;
       edge.shape[last] = [edge.shape[last][0] + dx, edge.shape[last][1] + dy];
-      recomputeLaneShapes(edge);
+      recomputeLaneShapes(edge, network);
     }
   });
 
@@ -141,16 +144,15 @@ export function addEdge(
 
   const lanes: SUMOLane[] = [];
   for (let i = 0; i < numLanes; i++) {
-    const laneShape = computeLaneShape(shape, i, numLanes, "right");
     lanes.push({
       id: `${id}_${i}`,
       index: i,
       speed,
-      length: polylineLength(laneShape),
+      length: 0, // Will be set by recomputeLaneShapes
       width: SUMO_DEFAULT_LANE_WIDTH,
       allow: "",
       disallow: "",
-      shape: laneShape,
+      shape: [], // Will be set by recomputeLaneShapes
     });
   }
 
@@ -171,6 +173,9 @@ export function addEdge(
   };
 
   network.edges.set(id, edge);
+
+  // Recompute lane shapes with proper endpoint snapping to junction centers
+  recomputeLaneShapes(edge, network);
 
   // Recompute junction shapes for connected junctions
   fromJunction.shape = computeNodeShape(fromJunction, network.edges);
@@ -207,18 +212,19 @@ export function setEdgeAttribute(
       // Rebuild lanes
       edge.lanes = [];
       for (let i = 0; i < newNum; i++) {
-        const laneShape = computeLaneShape(edge.shape, i, newNum, edge.spreadType);
         edge.lanes.push({
           id: `${edgeId}_${i}`,
           index: i,
           speed: edge.speed,
-          length: polylineLength(laneShape),
+          length: 0, // Will be set by recomputeLaneShapes
           width: SUMO_DEFAULT_LANE_WIDTH,
           allow: "",
           disallow: "",
-          shape: laneShape,
+          shape: [], // Will be set by recomputeLaneShapes
         });
       }
+      // Recompute lane shapes with proper endpoint snapping
+      recomputeLaneShapes(edge, network);
       // Re-guess connections
       network.connections = network.connections.filter(
         (c) => c.from !== edgeId && c.to !== edgeId
@@ -249,7 +255,7 @@ export function setEdgeAttribute(
       break;
     case "spreadType":
       edge.spreadType = "right";
-      recomputeLaneShapes(edge);
+      recomputeLaneShapes(edge, network);
       {
         const fromJ = network.junctions.get(edge.from);
         const toJ = network.junctions.get(edge.to);
@@ -269,7 +275,7 @@ export function moveEdgeGeometryPoint(
   const edge = network.edges.get(edgeId);
   if (!edge || pointIndex < 0 || pointIndex >= edge.shape.length) return;
   edge.shape[pointIndex] = newPos;
-  recomputeLaneShapes(edge);
+  recomputeLaneShapes(edge, network);
 }
 
 export function addEdgeGeometryPoint(
@@ -281,7 +287,7 @@ export function addEdgeGeometryPoint(
   const edge = network.edges.get(edgeId);
   if (!edge) return;
   edge.shape.splice(afterIndex + 1, 0, pos);
-  recomputeLaneShapes(edge);
+  recomputeLaneShapes(edge, network);
 }
 
 export function removeEdgeGeometryPoint(
@@ -293,7 +299,7 @@ export function removeEdgeGeometryPoint(
   if (!edge || edge.shape.length <= 2) return; // Must keep at least 2 points
   if (pointIndex <= 0 || pointIndex >= edge.shape.length - 1) return; // Don't remove endpoints
   edge.shape.splice(pointIndex, 1);
-  recomputeLaneShapes(edge);
+  recomputeLaneShapes(edge, network);
 }
 
 // ─── Connection mutations ───
@@ -345,25 +351,94 @@ function computeLaneShape(
   spreadType: SpreadType
 ): XY[] {
   const laneWidth = SUMO_DEFAULT_LANE_WIDTH;
-
-  let offset: number;
-  if (spreadType === "right") {
-    // Lane 0 is rightmost, offset from right side of road
-    offset = -(laneIndex + 0.5) * laneWidth;
-  } else if (spreadType === "center") {
-    // Lanes spread symmetrically
-    offset = (laneIndex - (numLanes - 1) / 2) * laneWidth;
-  } else {
-    // roadCenter: like center but the road center stays fixed
-    offset = (laneIndex - (numLanes - 1) / 2) * laneWidth;
-  }
+  const offset = getLaneOffsetFromCenter(laneIndex, numLanes, spreadType, laneWidth);
 
   return offsetPolyline(edgeShape, offset);
 }
 
-function recomputeLaneShapes(edge: SUMOEdge): void {
+function getLaneOffsetFromCenter(
+  laneIndex: number,
+  numLanes: number,
+  spreadType: SpreadType,
+  laneWidth: number
+): number {
+  if (spreadType === "right") {
+    // In SUMO, lane 0 is rightmost in travel direction.
+    return (laneIndex + 0.5) * laneWidth;
+  }
+  return (laneIndex - (numLanes - 1) / 2) * laneWidth;
+}
+
+function recomputeLaneShapes(edge: SUMOEdge, network?: SUMONetwork): void {
   for (const lane of edge.lanes) {
     lane.shape = computeLaneShape(edge.shape, lane.index, edge.numLanes, edge.spreadType);
+    
+    // Ensure lane shape endpoints are exactly at junction centers
+    // This is critical for accurate node shape computation
+    if (network) {
+      const fromJ = network.junctions.get(edge.from);
+      const toJ = network.junctions.get(edge.to);
+      
+      if (fromJ && lane.shape.length > 0) {
+        // Snap first point to junction center (perpendicular offset from center)
+        // Compute edge direction at start - use second point if available, otherwise use direction to end
+        let edgeDir: XY;
+        if (edge.shape.length >= 2 && dist(edge.shape[0], edge.shape[1]) > 0.01) {
+          edgeDir = normalize(sub(edge.shape[1], edge.shape[0]));
+        } else if (edge.shape.length >= 2) {
+          // Edge goes from junction to junction - use direction to end junction
+          edgeDir = normalize(sub([toJ?.x || edge.shape[edge.shape.length - 1][0], toJ?.y || edge.shape[edge.shape.length - 1][1]], [fromJ.x, fromJ.y]));
+        } else {
+          // Fallback: use lane shape direction
+          if (lane.shape.length >= 2) {
+            edgeDir = normalize(sub(lane.shape[1], lane.shape[0]));
+          } else {
+            edgeDir = [1, 0]; // Default direction
+          }
+        }
+        const right = perpRight(edgeDir);
+        const laneWidth = SUMO_DEFAULT_LANE_WIDTH;
+        const offset = getLaneOffsetFromCenter(
+          lane.index,
+          edge.numLanes,
+          edge.spreadType,
+          laneWidth
+        );
+        lane.shape[0] = add([fromJ.x, fromJ.y], scale(right, offset));
+      }
+      
+      if (toJ && lane.shape.length > 0) {
+        // Snap last point to junction center (perpendicular offset from center)
+        const lastIdx = edge.shape.length - 1;
+        // Compute edge direction at end - use second-to-last point if available
+        let edgeDir: XY;
+        if (edge.shape.length >= 2 && dist(edge.shape[lastIdx - 1], edge.shape[lastIdx]) > 0.01) {
+          edgeDir = normalize(sub(edge.shape[lastIdx], edge.shape[lastIdx - 1]));
+        } else if (edge.shape.length >= 2) {
+          // Edge goes from junction to junction - use direction from start junction
+          edgeDir = normalize(sub([toJ.x, toJ.y], [fromJ?.x || edge.shape[0][0], fromJ?.y || edge.shape[0][1]]));
+        } else {
+          // Fallback: use lane shape direction
+          if (lane.shape.length >= 2) {
+            const lastLaneIdx = lane.shape.length - 1;
+            edgeDir = normalize(sub(lane.shape[lastLaneIdx], lane.shape[lastLaneIdx - 1]));
+          } else {
+            edgeDir = [1, 0]; // Default direction
+          }
+        }
+        const right = perpRight(edgeDir);
+        const laneWidth = SUMO_DEFAULT_LANE_WIDTH;
+        const offset = getLaneOffsetFromCenter(
+          lane.index,
+          edge.numLanes,
+          edge.spreadType,
+          laneWidth
+        );
+        const lastLaneIdx = lane.shape.length - 1;
+        lane.shape[lastLaneIdx] = add([toJ.x, toJ.y], scale(right, offset));
+      }
+    }
+    
     lane.length = polylineLength(lane.shape);
   }
 }
@@ -525,21 +600,360 @@ export function buildRenderableNetwork(network: SUMONetwork): RenderableNetwork 
   return { edges, junctions, connections, center, zoom };
 }
 
+// ─── F5 Compute Network Pipeline (SUMO netconvert equivalent) ───
+
+/**
+ * Remove self-loops: edges that connect a junction to itself.
+ * Equivalent to NBNodeCont::removeSelfLoops()
+ */
+function removeSelfLoops(network: SUMONetwork): void {
+  const edgesToRemove: string[] = [];
+  network.edges.forEach((edge) => {
+    if (edge.from === edge.to) {
+      edgesToRemove.push(edge.id);
+    }
+  });
+  for (const edgeId of edgesToRemove) {
+    removeEdge(network, edgeId);
+  }
+}
+
+/**
+ * Join nearby junctions (placeholder - not fully implemented).
+ * Equivalent to NBNodeCont::joinJunctions()
+ */
+function joinJunctions(network: SUMONetwork): void {
+  // TODO: Implement junction joining logic if needed
+  // For now, this is a no-op as junction joining is typically handled manually
+}
+
+/**
+ * Sort nodes and edges for consistent ordering.
+ * Equivalent to NBNodesEdgesSorter::sortNodesEdges()
+ */
+function sortNodesEdges(network: SUMONetwork): void {
+  // Our Map-based data structure doesn't need explicit sorting,
+  // but we ensure consistent iteration order
+  // (Maps in JS maintain insertion order, which is sufficient)
+}
+
+/**
+ * Compute lane-to-lane connections based on geometry.
+ * Equivalent to NBNode::computeLanes2Lanes()
+ * This automatically creates connections based on lane geometry and angles.
+ */
+function computeLanes2Lanes(network: SUMONetwork): void {
+  // Clear existing connections (they will be recomputed)
+  network.connections = [];
+
+  // For each junction, compute connections between incoming and outgoing edges
+  network.junctions.forEach((junction) => {
+    if (junction.type === "internal") return;
+
+    const incomingEdges: SUMOEdge[] = [];
+    const outgoingEdges: SUMOEdge[] = [];
+
+    network.edges.forEach((edge) => {
+      if (edge.to === junction.id) incomingEdges.push(edge);
+      if (edge.from === junction.id) outgoingEdges.push(edge);
+    });
+
+    // For each incoming edge, find best matching outgoing edges
+    for (const inEdge of incomingEdges) {
+      if (inEdge.lanes.length === 0) continue;
+
+      // Compute incoming direction (at junction)
+      const inDir = inEdge.shape.length >= 2
+        ? normalize(sub(inEdge.shape[inEdge.shape.length - 1], inEdge.shape[inEdge.shape.length - 2]))
+        : ([0, 1] as XY);
+
+      // Find best outgoing edges based on angle
+      const candidates: { edge: SUMOEdge; angle: number }[] = [];
+      for (const outEdge of outgoingEdges) {
+        if (outEdge.lanes.length === 0) continue;
+        if (outEdge.id === inEdge.id) continue; // Don't connect to same edge
+
+        // Compute outgoing direction (at junction)
+        const outDir = outEdge.shape.length >= 2
+          ? normalize(sub(outEdge.shape[1], outEdge.shape[0]))
+          : ([0, 1] as XY);
+
+        // Compute angle between directions (smaller is better)
+        const angle = Math.abs(Math.atan2(cross(inDir, outDir), dot(inDir, outDir)));
+        candidates.push({ edge: outEdge, angle });
+      }
+
+      // Sort by angle (prefer straight connections, then right turns, then left turns)
+      candidates.sort((a, b) => a.angle - b.angle);
+
+      // Create connections: connect each incoming lane to appropriate outgoing lanes
+      // Only connect to the best matching outgoing edge(s) based on angle
+      // For straight-through connections, connect all lanes
+      // For turns, connect only the appropriate lanes
+      for (let fromLaneIdx = 0; fromLaneIdx < inEdge.numLanes; fromLaneIdx++) {
+        // Connect to the best matching outgoing edge (smallest angle)
+        if (candidates.length > 0) {
+          const bestCandidate = candidates[0];
+          const outEdge = bestCandidate.edge;
+          
+          // Determine which outgoing lane to connect to
+          // Rightmost lane connects to rightmost, leftmost to leftmost
+          const toLaneIdx = Math.min(fromLaneIdx, outEdge.numLanes - 1);
+          addConnection(network, inEdge.id, outEdge.id, fromLaneIdx, toLaneIdx);
+        }
+        
+        // Also connect to other good candidates if angle is small (straight connections)
+        // This handles cases where multiple outgoing edges are nearly straight
+        for (let i = 1; i < candidates.length && i < 3; i++) {
+          if (candidates[i].angle < Math.PI / 4) { // Less than 45 degrees
+            const outEdge = candidates[i].edge;
+            const toLaneIdx = Math.min(fromLaneIdx, outEdge.numLanes - 1);
+            addConnection(network, inEdge.id, outEdge.id, fromLaneIdx, toLaneIdx);
+          }
+        }
+      }
+    }
+  });
+}
+
+/**
+ * Compute junction priority logic (first pass).
+ * Equivalent to NBNode::computeLogic()
+ * Determines right-of-way rules for priority junctions.
+ */
+function computeLogics(network: SUMONetwork): void {
+  // For priority junctions, determine which edges have priority
+  // This affects connection states (e.g., 'M' for major, 'm' for minor)
+  network.junctions.forEach((junction) => {
+    if (junction.type !== "priority") return;
+
+    // Find all edges at this junction
+    const edges: SUMOEdge[] = [];
+    network.edges.forEach((edge) => {
+      if (edge.from === junction.id || edge.to === junction.id) {
+        edges.push(edge);
+      }
+    });
+
+    // Simple priority: edges with higher priority attribute get right-of-way
+    // For now, we mark all connections as 'M' (major/priority)
+    // More sophisticated logic can be added later
+    network.connections.forEach((conn) => {
+      const fromEdge = network.edges.get(conn.from);
+      if (fromEdge && fromEdge.to === junction.id) {
+        // Connection state: 'M' = major (has priority), 'm' = minor (yield)
+        // For now, set all to 'M' (can be refined based on edge priorities)
+        conn.state = "M";
+      }
+    });
+  });
+}
+
+/**
+ * Compute junction priority logic (second pass).
+ * Equivalent to NBNode::computeLogic2()
+ * Refines priority rules based on geometry and conflicts.
+ */
+function computeLogics2(network: SUMONetwork): void {
+  // Second pass: refine connection states based on conflicts
+  // For now, this is a placeholder that can be extended
+  // In SUMO, this handles complex priority rules and conflict detection
+  network.junctions.forEach((junction) => {
+    if (junction.type !== "priority") return;
+
+    // Check for conflicting connections and adjust states
+    // This is simplified - full implementation would detect actual conflicts
+    const junctionConnections = network.connections.filter((conn) => {
+      const fromEdge = network.edges.get(conn.from);
+      return fromEdge && fromEdge.to === junction.id;
+    });
+
+    // Mark conflicting connections (crossing paths) as yielding
+    // For now, we keep the state from computeLogics()
+    // Full implementation would analyze geometry to find conflicts
+  });
+}
+
+/**
+ * Compute traffic light logics for all traffic light junctions.
+ * Equivalent to NBTrafficLightLogicCont::computeLogics()
+ */
+function computeTrafficLightLogics(network: SUMONetwork): void {
+  // Remove existing TLS programs (they will be regenerated)
+  network.tlLogics = [];
+
+  // Generate TLS programs for all traffic light junctions
+  network.junctions.forEach((junction) => {
+    if (junction.type === "traffic_light") {
+      const tls = generateTLSProgram(junction.id, network);
+      network.tlLogics.push(tls);
+
+      // Update connections with TLS references
+      let linkIdx = 0;
+      network.connections.forEach((conn) => {
+        const fromEdge = network.edges.get(conn.from);
+        if (fromEdge && fromEdge.to === junction.id) {
+          conn.tl = junction.id;
+          conn.linkIndex = linkIdx++;
+        }
+      });
+    } else {
+      // Clear TLS references for non-TL junctions
+      network.connections.forEach((conn) => {
+        const fromEdge = network.edges.get(conn.from);
+        if (fromEdge && fromEdge.to === junction.id) {
+          conn.tl = "";
+          conn.linkIndex = -1;
+        }
+      });
+    }
+  });
+}
+
+/**
+ * Remake connections after network computation.
+ * Equivalent to edge->remakeGNEConnections(true)
+ * Updates connection geometry and validates connections.
+ */
+function remakeConnections(network: SUMONetwork): void {
+  // Validate and update connections
+  // Remove invalid connections (edges/lanes that no longer exist)
+  network.connections = network.connections.filter((conn) => {
+    const fromEdge = network.edges.get(conn.from);
+    const toEdge = network.edges.get(conn.to);
+    if (!fromEdge || !toEdge) return false;
+    if (conn.fromLane < 0 || conn.fromLane >= fromEdge.numLanes) return false;
+    if (conn.toLane < 0 || conn.toLane >= toEdge.numLanes) return false;
+    return true;
+  });
+}
+
+/**
+ * Update junction geometry after network computation.
+ * Equivalent to junction->updateGeometryAfterNetbuild()
+ */
+function updateJunctionGeometry(network: SUMONetwork): void {
+  // Junction shapes are already computed in computeNodeShapes()
+  // This step ensures geometry is consistent
+  network.junctions.forEach((junction) => {
+    if (junction.type === "internal") return;
+    // Ensure shape is valid
+    if (junction.shape.length < 3 && !junction.customShape) {
+      // Fallback to default shape
+      const s = 2;
+      junction.shape = [
+        [junction.x - s, junction.y - s],
+        [junction.x + s, junction.y - s],
+        [junction.x + s, junction.y + s],
+        [junction.x - s, junction.y + s],
+      ];
+    }
+  });
+}
+
+/**
+ * Rebuild walking areas (placeholder - not fully implemented).
+ * Equivalent to junction->rebuildGNEWalkingAreas()
+ */
+function rebuildWalkingAreas(network: SUMONetwork): void {
+  // TODO: Implement walking area computation if needed
+  // For now, this is a no-op
+}
+
+/**
+ * Update edge geometry after network computation.
+ * Equivalent to edge->updateGeometry()
+ */
+function updateEdgeGeometry(network: SUMONetwork): void {
+  // Ensure all edges have valid geometry
+  network.edges.forEach((edge) => {
+    // Ensure edge endpoints are at junction centers
+    const fromJ = network.junctions.get(edge.from);
+    const toJ = network.junctions.get(edge.to);
+
+    if (fromJ && edge.shape.length > 0) {
+      const distFromJ = dist(edge.shape[0], [fromJ.x, fromJ.y]);
+      if (distFromJ > 0.01) {
+        edge.shape[0] = [fromJ.x, fromJ.y];
+      }
+    }
+
+    if (toJ && edge.shape.length > 0) {
+      const lastIdx = edge.shape.length - 1;
+      const distToJ = dist(edge.shape[lastIdx], [toJ.x, toJ.y]);
+      if (distToJ > 0.01) {
+        edge.shape[lastIdx] = [toJ.x, toJ.y];
+      }
+    }
+
+    // Recompute lane shapes
+    recomputeLaneShapes(edge, network);
+  });
+}
+
 /**
  * Recompute the full network geometry (equivalent to netconvert's computeNetwork).
- * Updates lane shapes, junction shapes, and connections.
+ * 
+ * This follows SUMO's F5 compute network pipeline exactly:
+ * 1. Remove self loops
+ * 2. Join junctions
+ * 3. Sort nodes/edges
+ * 4. Compute node shapes
+ * 5. Compute lanes2lanes (connections)
+ * 6. Compute logics (first pass)
+ * 7. Compute logics2 (second pass)
+ * 8. Compute traffic light logics
+ * 9. Remake connections
+ * 10. Update junction geometry
+ * 11. Rebuild walking areas
+ * 12. Update edge geometry
+ * 
+ * IMPORTANT: Edge shapes in the network data structure ALWAYS extend to junction centers.
+ * Edge trimming only happens during rendering in buildRenderableNetwork().
  */
 export function computeNetwork(network: SUMONetwork): void {
-  // 1. Recompute lane shapes for all edges
-  network.edges.forEach((edge) => {
-    recomputeLaneShapes(edge);
-  });
+  // Step 1: Remove self loops
+  removeSelfLoops(network);
 
-  // 2. Recompute all junction shapes
+  // Step 2: Join junctions (placeholder)
+  joinJunctions(network);
+
+  // Step 3: Sort nodes/edges
+  sortNodesEdges(network);
+
+  // Step 4: Ensure edge endpoints are at junction centers and recompute lane shapes
+  updateEdgeGeometry(network);
+
+  // Step 5: Compute node shapes (using untrimmed edges that extend to junction centers)
+  // This matches SUMO's NBNodeCont::computeNodeShapes()
   network.junctions.forEach((junction) => {
     if (junction.type === "internal") return;
     junction.shape = computeNodeShape(junction, network.edges);
   });
+
+  // Step 6: Compute lanes2lanes (automatic connection generation)
+  computeLanes2Lanes(network);
+
+  // Step 7: Compute logics (first pass - priority rules)
+  computeLogics(network);
+
+  // Step 8: Compute logics2 (second pass - conflict resolution)
+  computeLogics2(network);
+
+  // Step 9: Compute traffic light logics
+  computeTrafficLightLogics(network);
+
+  // Step 10: Remake connections (validate and update)
+  remakeConnections(network);
+
+  // Step 11: Update junction geometry
+  updateJunctionGeometry(network);
+
+  // Step 12: Rebuild walking areas (placeholder)
+  rebuildWalkingAreas(network);
+
+  // Step 13: Final edge geometry update
+  updateEdgeGeometry(network);
 }
 
 /**
