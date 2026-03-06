@@ -308,6 +308,11 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         },
       });
       clearDirty();
+      // Automatically compute network on first load to correct junction positions and shapes
+      // This ensures geometry is properly calculated by netconvert
+      setTimeout(() => {
+        get().doComputeNetwork();
+      }, 0);
     },
 
     createNew: (lng, lat) => {
