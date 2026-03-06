@@ -20,7 +20,11 @@ const JUNCTION_TYPES: JunctionType[] = [
 export default function InspectorPanel() {
   const selection = useUIStore((s) => s.selection);
   const editMode = useUIStore((s) => s.editMode);
+  const setSelection = useUIStore((s) => s.setSelection);
   const network = useNetworkStore((s) => s.network);
+  const doRemoveJunction = useNetworkStore((s) => s.doRemoveJunction);
+  const doRemoveEdge = useNetworkStore((s) => s.doRemoveEdge);
+  const doRemoveConnection = useNetworkStore((s) => s.doRemoveConnection);
 
   if (!selection || !network) return null;
 
@@ -32,16 +36,58 @@ export default function InspectorPanel() {
     return <TLSEditor junctionId={selection.id} />;
   }
 
+  const handleDelete = () => {
+    if (!selection) return;
+    switch (selection.type) {
+      case "junction":
+        doRemoveJunction(selection.id);
+        break;
+      case "edge":
+        doRemoveEdge(selection.id);
+        break;
+      case "connection": {
+        // Parse connection ID: "from_fromLane-to_toLane"
+        const parts = selection.id.split("-");
+        if (parts.length === 2) {
+          const [fromPart, toPart] = parts;
+          const fromMatch = fromPart.match(/^(.+)_(\d+)$/);
+          const toMatch = toPart.match(/^(.+)_(\d+)$/);
+          if (fromMatch && toMatch) {
+            const [, from, fromLane] = fromMatch;
+            const [, to, toLane] = toMatch;
+            doRemoveConnection(from, to, parseInt(fromLane), parseInt(toLane));
+          }
+        }
+        break;
+      }
+    }
+    setSelection(null);
+  };
+
   return (
     <div className="absolute right-2 top-16 z-10 w-72 bg-gray-800/95 rounded-lg shadow-lg backdrop-blur-sm overflow-hidden">
-      <div className="px-3 py-2 bg-gray-700 text-sm font-semibold text-gray-200 border-b border-gray-600">
-        {selection.type.charAt(0).toUpperCase() + selection.type.slice(1)}: {selection.id}
+      <div className="px-3 py-2 bg-gray-700 text-sm font-semibold text-gray-200 border-b border-gray-600 flex items-center justify-between">
+        <span>
+          {selection.type.charAt(0).toUpperCase() + selection.type.slice(1)}: {selection.id}
+        </span>
+        <button
+          onClick={handleDelete}
+          className="px-2 py-1 text-xs bg-red-700/80 text-red-100 rounded hover:bg-red-600 transition-colors"
+          title="Delete selected object"
+        >
+          Delete
+        </button>
       </div>
       <div className="p-3 space-y-2 max-h-[60vh] overflow-y-auto text-sm">
         {selection.type === "junction" && <JunctionInspector id={selection.id} />}
         {selection.type === "edge" && <EdgeInspector id={selection.id} />}
         {selection.type === "lane" && (
           <LaneInspector laneId={selection.id} edgeId={selection.subId} />
+        )}
+        {selection.type === "connection" && (
+          <div className="text-gray-400 text-xs">
+            Connection: {selection.id}
+          </div>
         )}
       </div>
     </div>
