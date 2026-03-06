@@ -21,8 +21,6 @@ export default function InspectorPanel() {
   const selection = useUIStore((s) => s.selection);
   const editMode = useUIStore((s) => s.editMode);
   const network = useNetworkStore((s) => s.network);
-  const doSetEdgeAttribute = useNetworkStore((s) => s.doSetEdgeAttribute);
-  const doSetJunctionType = useNetworkStore((s) => s.doSetJunctionType);
 
   if (!selection || !network) return null;
 
@@ -41,8 +39,9 @@ export default function InspectorPanel() {
       </div>
       <div className="p-3 space-y-2 max-h-[60vh] overflow-y-auto text-sm">
         {selection.type === "junction" && <JunctionInspector id={selection.id} />}
-        {(selection.type === "edge" || selection.type === "lane") && (
-          <EdgeInspector id={selection.type === "lane" ? selection.id.replace(/_\d+$/, "") : selection.id} />
+        {selection.type === "edge" && <EdgeInspector id={selection.id} />}
+        {selection.type === "lane" && (
+          <LaneInspector laneId={selection.id} edgeId={selection.subId} />
         )}
       </div>
     </div>
@@ -52,6 +51,7 @@ export default function InspectorPanel() {
 function JunctionInspector({ id }: { id: string }) {
   const network = useNetworkStore((s) => s.network);
   const doSetJunctionType = useNetworkStore((s) => s.doSetJunctionType);
+  const doMoveJunction = useNetworkStore((s) => s.doMoveJunction);
   const junction = network?.junctions.get(id);
   if (!junction) return <div className="text-gray-400">Junction not found</div>;
 
@@ -70,8 +70,28 @@ function JunctionInspector({ id }: { id: string }) {
           ))}
         </select>
       </div>
-      <Field label="X" value={junction.x.toFixed(2)} />
-      <Field label="Y" value={junction.y.toFixed(2)} />
+      <EditableField
+        label="X"
+        value={junction.x.toFixed(2)}
+        onChange={(v) => {
+          const x = Number(v);
+          if (Number.isFinite(x)) {
+            doMoveJunction(id, x, junction.y);
+          }
+        }}
+        type="number"
+      />
+      <EditableField
+        label="Y"
+        value={junction.y.toFixed(2)}
+        onChange={(v) => {
+          const y = Number(v);
+          if (Number.isFinite(y)) {
+            doMoveJunction(id, junction.x, y);
+          }
+        }}
+        type="number"
+      />
       <Field label="Incoming lanes" value={junction.incLanes.length.toString()} />
     </>
   );
@@ -118,8 +138,61 @@ function EdgeInspector({ id }: { id: string }) {
         value={edge.allow}
         onChange={(v) => doSetEdgeAttribute(edge.id, "allow", v)}
       />
+      <EditableField
+        label="Disallow"
+        value={edge.disallow}
+        onChange={(v) => doSetEdgeAttribute(edge.id, "disallow", v)}
+      />
       <Field label="Spread" value="right" />
       <Field label="Length" value={edge.lanes[0]?.length.toFixed(2) ?? "0"} />
+    </>
+  );
+}
+
+function LaneInspector({ laneId, edgeId }: { laneId: string; edgeId?: string }) {
+  const network = useNetworkStore((s) => s.network);
+  const doSetLaneAttribute = useNetworkStore((s) => s.doSetLaneAttribute);
+
+  let edge = edgeId ? network?.edges.get(edgeId) : undefined;
+  if (!edge && network) {
+    for (const candidate of Array.from(network.edges.values())) {
+      if (candidate.lanes.some((l) => l.id === laneId)) {
+        edge = candidate;
+        break;
+      }
+    }
+  }
+  const lane = edge?.lanes.find((l) => l.id === laneId);
+  if (!lane || !edge) return <div className="text-gray-400">Lane not found</div>;
+
+  return (
+    <>
+      <Field label="ID" value={lane.id} />
+      <Field label="Edge" value={edge.id} />
+      <Field label="Index" value={lane.index.toString()} />
+      <EditableField
+        label="Speed"
+        value={lane.speed.toFixed(2)}
+        onChange={(v) => doSetLaneAttribute(lane.id, "speed", Number(v))}
+        type="number"
+      />
+      <EditableField
+        label="Width"
+        value={lane.width.toFixed(2)}
+        onChange={(v) => doSetLaneAttribute(lane.id, "width", Number(v))}
+        type="number"
+      />
+      <EditableField
+        label="Allow"
+        value={lane.allow}
+        onChange={(v) => doSetLaneAttribute(lane.id, "allow", v)}
+      />
+      <EditableField
+        label="Disallow"
+        value={lane.disallow}
+        onChange={(v) => doSetLaneAttribute(lane.id, "disallow", v)}
+      />
+      <Field label="Length" value={lane.length.toFixed(2)} />
     </>
   );
 }

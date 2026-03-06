@@ -8,6 +8,7 @@ const MODE_HINTS: Record<string, string> = {
   inspect: "Click elements to inspect properties",
   select: "Click to select elements",
   move: "Click and drag junctions or geometry points",
+  draw: "Click to place start node, click to add geometry points, double-click to finish edge",
   createJunction: "Click on the map to create a junction",
   createEdge: "Click a junction to start, click another to create edge",
   delete: "Click elements to delete them",

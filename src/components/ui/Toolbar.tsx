@@ -6,9 +6,9 @@ import { useUIStore, type EditMode } from "@/store/uiStore";
 const TOOLS: { mode: EditMode; label: string; key: string; icon: string }[] = [
   { mode: "inspect", label: "Inspect", key: "I", icon: "i" },
   { mode: "select", label: "Select", key: "S", icon: "S" },
+  { mode: "draw", label: "Draw Edge", key: "E", icon: "D" },
   { mode: "move", label: "Move", key: "M", icon: "M" },
   { mode: "createJunction", label: "Create Junction", key: "N", icon: "J" },
-  { mode: "createEdge", label: "Create Edge", key: "E", icon: "E" },
   { mode: "delete", label: "Delete", key: "D", icon: "X" },
   { mode: "connection", label: "Connection", key: "C", icon: "C" },
   { mode: "tls", label: "Traffic Light", key: "T", icon: "T" },

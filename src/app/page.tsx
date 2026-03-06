@@ -7,7 +7,6 @@ import InspectorPanel from "@/components/ui/InspectorPanel";
 import StatusBar from "@/components/ui/StatusBar";
 import FileUpload from "@/components/ui/FileUpload";
 import { useNetworkStore } from "@/store/networkStore";
-import { useUIStore } from "@/store/uiStore";
 
 const NetworkMap = dynamic(() => import("@/components/map/NetworkMap"), {
   ssr: false,
@@ -21,6 +20,7 @@ const NetworkMap = dynamic(() => import("@/components/map/NetworkMap"), {
 export default function Home() {
   const undo = useNetworkStore((s) => s.undo);
   const redo = useNetworkStore((s) => s.redo);
+  const doComputeNetwork = useNetworkStore((s) => s.doComputeNetwork);
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -35,10 +35,14 @@ export default function Home() {
         e.preventDefault();
         redo();
       }
+      if (e.key === "F5") {
+        e.preventDefault();
+        void doComputeNetwork();
+      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [undo, redo]);
+  }, [undo, redo, doComputeNetwork]);
 
   return (
     <div className="w-screen h-screen relative overflow-hidden">
