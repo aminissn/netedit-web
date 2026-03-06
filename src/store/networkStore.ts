@@ -78,6 +78,8 @@ interface NetworkState {
   dirtyTLS: Set<string>;
   /** Edges whose numLanes changed — emit reset directives in con.xml */
   resetConnectionEdges: Set<string>;
+  /** Connections that existed before numLanes change (for writing to con.xml) */
+  resetConnectionSnapshots: Map<string, { from: string; to: string }[]>;
   /** Individually added connections */
   addedConnections: { from: string; to: string; fromLane: number; toLane: number }[];
   /** Individually removed connections */
@@ -166,6 +168,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       dirtyEdges: new Set<string>(),
       dirtyTLS: new Set<string>(),
       resetConnectionEdges: new Set<string>(),
+      resetConnectionSnapshots: new Map<string, { from: string; to: string }[]>(),
       addedConnections: [],
       removedConnections: [],
     });
@@ -262,6 +265,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
     dirtyEdges: new Set<string>(),
     dirtyTLS: new Set<string>(),
     resetConnectionEdges: new Set<string>(),
+    resetConnectionSnapshots: new Map<string, { from: string; to: string }[]>(),
     addedConnections: [],
     removedConnections: [],
 
@@ -398,12 +402,25 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       pushHistory();
       const edge = network.edges.get(id);
       const oldNumLanes = edge?.numLanes;
-      setEdgeAttribute(network, id, attr, value);
-      markDirtyEdge(id);
-      if (attr === "numLanes") {
-  
+      
+      // If numLanes is changing, capture connections before they're removed
+      if (attr === "numLanes" && oldNumLanes !== undefined && oldNumLanes !== value) {
+        const connectionsToCapture: { from: string; to: string }[] = [];
+        for (const conn of network.connections) {
+          if (conn.from === id || conn.to === id) {
+            connectionsToCapture.push({ from: conn.from, to: conn.to });
+          }
+        }
+        if (connectionsToCapture.length > 0) {
+          const snapshots = new Map(get().resetConnectionSnapshots);
+          snapshots.set(id, connectionsToCapture);
+          set({ resetConnectionSnapshots: snapshots });
+        }
         get().resetConnectionEdges.add(id);
       }
+      
+      setEdgeAttribute(network, id, attr, value);
+      markDirtyEdge(id);
       rebuildRenderable();
 
       // Automatically trigger compute network (F5) when numLanes changes
@@ -605,7 +622,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
     },
 
     doComputeNetwork: async () => {
-      const { network, isComputing, baseNetXML, dirtyNodes, dirtyEdges, dirtyTLS, resetConnectionEdges, addedConnections, removedConnections } = get();
+      const { network, isComputing, baseNetXML, dirtyNodes, dirtyEdges, dirtyTLS, resetConnectionEdges, resetConnectionSnapshots, addedConnections, removedConnections } = get();
       if (!network || isComputing) return;
       const snapshot = deepCloneNetwork(network);
       set({ isComputing: true, computeError: null });
@@ -630,7 +647,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
           if (nodPatch) payload.nodXML = nodPatch;
           if (edgPatch) payload.edgXML = edgPatch;
           if (hasConnectionChanges) {
-            payload.conXML = exportPatchConXML(resetConnectionEdges, addedConnections, removedConnections, network);
+            payload.conXML = exportPatchConXML(resetConnectionEdges, resetConnectionSnapshots, addedConnections, removedConnections, network);
           }
           if (tllPatch) payload.tllXML = tllPatch;
         } else {

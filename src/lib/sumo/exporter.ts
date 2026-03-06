@@ -205,6 +205,7 @@ interface ConnectionEntry {
  */
 export function exportPatchConXML(
   resetEdges: Set<string>,
+  resetConnectionSnapshots: Map<string, { from: string; to: string }[]>,
   addedConnections: ConnectionEntry[],
   removedConnections: ConnectionEntry[],
   network: SUMONetwork
@@ -215,25 +216,28 @@ export function exportPatchConXML(
 
   // Write all connections from and to edges with numLanes changes
   // Each connection must contain both from and to edge IDs with reset="true"
+  // Use snapshots captured before connections were removed
   const writtenConnections = new Set<string>();
   for (const edgeId of Array.from(resetEdges)) {
-    // Find all connections FROM this edge
-    for (const conn of network.connections) {
-      if (conn.from === edgeId) {
+    // First try to use captured snapshot (connections before removal)
+    const snapshot = resetConnectionSnapshots.get(edgeId);
+    if (snapshot && snapshot.length > 0) {
+      for (const conn of snapshot) {
         const key = `${conn.from}-${conn.to}`;
         if (!writtenConnections.has(key)) {
           lines.push(`    <connection from="${escapeAttr(conn.from)}" to="${escapeAttr(conn.to)}" reset="true"/>`);
           writtenConnections.add(key);
         }
       }
-    }
-    // Find all connections TO this edge
-    for (const conn of network.connections) {
-      if (conn.to === edgeId) {
-        const key = `${conn.from}-${conn.to}`;
-        if (!writtenConnections.has(key)) {
-          lines.push(`    <connection from="${escapeAttr(conn.from)}" to="${escapeAttr(conn.to)}" reset="true"/>`);
-          writtenConnections.add(key);
+    } else {
+      // Fallback: try to find in current network (in case connections weren't removed yet)
+      for (const conn of network.connections) {
+        if (conn.from === edgeId || conn.to === edgeId) {
+          const key = `${conn.from}-${conn.to}`;
+          if (!writtenConnections.has(key)) {
+            lines.push(`    <connection from="${escapeAttr(conn.from)}" to="${escapeAttr(conn.to)}" reset="true"/>`);
+            writtenConnections.add(key);
+          }
         }
       }
     }

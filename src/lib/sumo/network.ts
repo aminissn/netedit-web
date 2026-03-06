@@ -183,8 +183,8 @@ export function addEdge(
   // Recompute lane shapes with proper endpoint snapping to junction centers
   recomputeLaneShapes(edge, network);
 
-  // Guess connections
-  guessConnectionsForEdge(network, edge);
+  // Do NOT guess connections here - netconvert will compute them
+  // Connections are only computed by netconvert and parsed from its output
 
   return edge;
 }
@@ -227,11 +227,11 @@ export function setEdgeAttribute(
       }
       // Recompute lane shapes with proper endpoint snapping
       recomputeLaneShapes(edge, network);
-      // Re-guess connections
+      // Remove connections involving this edge - they will be recomputed by netconvert
       network.connections = network.connections.filter(
         (c) => c.from !== edgeId && c.to !== edgeId
       );
-      guessConnectionsForEdge(network, edge);
+      // Do NOT guess connections here - netconvert will compute them
       break;
     }
     case "speed":
@@ -476,6 +476,10 @@ function recomputeLaneShapes(edge: SUMOEdge, network?: SUMONetwork): void {
   }
 }
 
+/**
+ * @deprecated This function is NOT used - connections are only computed by netconvert.
+ * Connections are parsed from netconvert output XML, not computed in the frontend.
+ */
 function guessConnectionsForEdge(network: SUMONetwork, edge: SUMOEdge): void {
   // Find outgoing edges from the 'to' junction
   const toJunction = network.junctions.get(edge.to);
@@ -681,9 +685,11 @@ function sortNodesEdges(network: SUMONetwork): void {
 }
 
 /**
- * Compute lane-to-lane connections based on geometry.
- * Equivalent to NBNode::computeLanes2Lanes()
- * This automatically creates connections based on lane geometry and angles.
+ * @deprecated This function is NOT used - connections are only computed by netconvert.
+ * Connections are parsed from netconvert output XML, not computed in the frontend.
+ * 
+ * This function was an approximation of SUMO's connection computation logic,
+ * but we rely on netconvert for accurate connection computation.
  */
 function computeLanes2Lanes(network: SUMONetwork): void {
   // Clear existing connections (they will be recomputed)
@@ -969,68 +975,31 @@ function updateEdgeGeometry(network: SUMONetwork): void {
 }
 
 /**
- * Recompute the full network geometry (equivalent to netconvert's computeNetwork).
+ * Recompute basic network geometry for UI display.
  * 
- * This follows SUMO's F5 compute network pipeline exactly:
- * 1. Remove self loops
- * 2. Join junctions
- * 3. Sort nodes/edges
- * 4. Compute node shapes
- * 5. Compute lanes2lanes (connections)
- * 6. Compute logics (first pass)
- * 7. Compute logics2 (second pass)
- * 8. Compute traffic light logics
- * 9. Remake connections
- * 10. Update junction geometry
- * 11. Rebuild walking areas
- * 12. Update edge geometry
+ * NOTE: This function does NOT compute connections or shapes - those are computed by netconvert.
+ * This function only does minimal geometry updates needed for UI rendering before netconvert runs.
  * 
- * IMPORTANT: Edge shapes in the network data structure ALWAYS extend to junction centers.
+ * IMPORTANT: 
+ * - Connections are ONLY computed by netconvert and parsed from its output
+ * - Node shapes are ONLY computed by netconvert and parsed from its output
+ * - Edge/lane shapes are ONLY computed by netconvert and parsed from its output
+ * - This function only ensures basic consistency (edge endpoints at junctions, lane shape snapping)
+ * 
+ * Edge shapes in the network data structure ALWAYS extend to junction centers.
  * Edge trimming only happens during rendering in buildRenderableNetwork().
  */
 export function computeNetwork(network: SUMONetwork): void {
+  // Only do minimal geometry updates - all real computation is done by netconvert
   // Step 1: Remove self loops
   removeSelfLoops(network);
 
-  // Step 2: Join junctions (placeholder)
-  joinJunctions(network);
-
-  // Step 3: Sort nodes/edges
-  sortNodesEdges(network);
-
-  // Step 4: Ensure edge endpoints are at junction centers and recompute lane shapes
+  // Step 2: Ensure edge endpoints are at junction centers and recompute lane shapes
+  // This is only for UI consistency - netconvert will recompute everything
   updateEdgeGeometry(network);
 
-  // Step 5: Compute node shapes (using untrimmed edges that extend to junction centers)
-  // This matches SUMO's NBNodeCont::computeNodeShapes()
-  network.junctions.forEach((junction) => {
-    if (junction.type === "internal") return;
-    junction.shape = computeNodeShape(junction, network.edges);
-  });
-
-  // Step 6: Compute lanes2lanes (automatic connection generation)
-  computeLanes2Lanes(network);
-
-  // Step 7: Compute logics (first pass - priority rules)
-  computeLogics(network);
-
-  // Step 8: Compute logics2 (second pass - conflict resolution)
-  computeLogics2(network);
-
-  // Step 9: Compute traffic light logics
-  computeTrafficLightLogics(network);
-
-  // Step 10: Remake connections (validate and update)
-  remakeConnections(network);
-
-  // Step 11: Update junction geometry
-  updateJunctionGeometry(network);
-
-  // Step 12: Rebuild walking areas (placeholder)
-  rebuildWalkingAreas(network);
-
-  // Step 13: Final edge geometry update
-  updateEdgeGeometry(network);
+  // Do NOT compute connections, node shapes, or logics here - netconvert does that
+  // Connections and shapes come from netconvert output only
 }
 
 /**
