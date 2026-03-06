@@ -33,8 +33,12 @@ export default function InspectorPanel() {
     return <ConnectionEditor junctionId={selection.id} />;
   }
 
-  if (editMode === "tls" && selection.type === "junction") {
-    return <TLSEditor junctionId={selection.id} />;
+  // Show TLS editor if junction is a traffic light (in any mode)
+  if (selection.type === "junction") {
+    const junction = network.junctions.get(selection.id);
+    if (junction && junction.type === "traffic_light") {
+      return <TLSEditor junctionId={selection.id} />;
+    }
   }
 
   const handleDelete = () => {
