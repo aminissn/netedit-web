@@ -27,6 +27,10 @@ export const COLORS = {
   tlsGreen: [0, 255, 0, 255] as RGBA,
   tlsYellow: [255, 255, 0, 255] as RGBA,
   tlsRed: [255, 0, 0, 255] as RGBA,
+  tlsGreenDim: [0, 200, 0, 200] as RGBA,
+  tlsYellowDim: [200, 200, 0, 200] as RGBA,
+  tlsRedDim: [200, 0, 0, 200] as RGBA,
+  tlsOff: [100, 100, 100, 150] as RGBA,
 
   // Lane permission colors
   lanePermissionPedestrian: [153, 217, 234, 200] as RGBA,

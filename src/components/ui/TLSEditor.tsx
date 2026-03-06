@@ -2,6 +2,7 @@
 
 import React, { useMemo } from "react";
 import { useNetworkStore } from "@/store/networkStore";
+import { useUIStore } from "@/store/uiStore";
 import type { TLSPhase } from "@/lib/sumo/types";
 
 const STATE_COLORS: Record<string, string> = {
@@ -21,12 +22,21 @@ interface Props {
 export default function TLSEditor({ junctionId }: Props) {
   const network = useNetworkStore((s) => s.network);
   const doSetJunctionType = useNetworkStore((s) => s.doSetJunctionType);
+  const doSetTLSOffset = useNetworkStore((s) => s.doSetTLSOffset);
+  const doSetTLSPhaseDuration = useNetworkStore((s) => s.doSetTLSPhaseDuration);
+  const doSetTLSPhaseState = useNetworkStore((s) => s.doSetTLSPhaseState);
+  const doAddTLSPhase = useNetworkStore((s) => s.doAddTLSPhase);
+  const doRemoveTLSPhase = useNetworkStore((s) => s.doRemoveTLSPhase);
+  const selectedTLSPhase = useUIStore((s) => s.selectedTLSPhase);
+  const setSelectedTLSPhase = useUIStore((s) => s.setSelectedTLSPhase);
 
   const junction = network?.junctions.get(junctionId);
   const tls = useMemo(
     () => network?.tlLogics.find((t) => t.id === junctionId),
     [network?.tlLogics, junctionId]
   );
+  
+  const selectedPhaseIndex = selectedTLSPhase.get(junctionId);
 
   if (!junction) return null;
 
@@ -51,29 +61,65 @@ export default function TLSEditor({ junctionId }: Props) {
             </button>
           </div>
         ) : (
-          <div className="space-y-3">
-            <div className="flex justify-between text-xs text-gray-400">
-              <span>Program: {tls?.programID ?? "0"}</span>
-              <span>Type: {tls?.type ?? "static"}</span>
-            </div>
-
-            {tls && tls.phases.length > 0 ? (
-              <div className="space-y-1">
-                <div className="text-xs text-gray-400 mb-2">
-                  Phases ({tls.phases.length})
-                </div>
-                {tls.phases.map((phase, i) => (
-                  <PhaseRow key={i} index={i} phase={phase} />
-                ))}
-                <div className="text-xs text-gray-400 mt-2">
-                  Total cycle: {tls.phases.reduce((s, p) => s + p.duration, 0)}s
-                </div>
+            <div className="space-y-3">
+              <div className="flex justify-between text-xs text-gray-400">
+                <span>Program: {tls?.programID ?? "0"}</span>
+                <span>Type: {tls?.type ?? "static"}</span>
               </div>
-            ) : (
-              <div className="text-gray-400 text-xs">No phases defined</div>
-            )}
+              {tls && (
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-gray-400">Offset</span>
+                  <input
+                    type="number"
+                    value={tls.offset}
+                    onChange={(e) => doSetTLSOffset(junctionId, Number(e.target.value))}
+                    className="bg-gray-700 text-white px-2 py-1 rounded border border-gray-600 w-24"
+                  />
+                </div>
+              )}
 
-            <button
+              {tls && tls.phases.length > 0 ? (
+                <div className="space-y-1">
+                  <div className="text-xs text-gray-400 mb-2">
+                    Phases ({tls.phases.length})
+                  </div>
+                  {tls.phases.map((phase, i) => (
+                    <PhaseRow
+                      key={i}
+                      index={i}
+                      phase={phase}
+                      junctionId={junctionId}
+                      isSelected={selectedPhaseIndex === i}
+                      onSelect={() => setSelectedTLSPhase(junctionId, i)}
+                      onDeselect={() => setSelectedTLSPhase(junctionId, null)}
+                      onDurationChange={(v) => doSetTLSPhaseDuration(junctionId, i, v)}
+                      onStateChange={(v) => doSetTLSPhaseState(junctionId, i, v)}
+                      onRemove={() => doRemoveTLSPhase(junctionId, i)}
+                    />
+                  ))}
+                  <div className="text-xs text-gray-400 mt-2">
+                    Total cycle: {tls.phases.reduce((s, p) => s + p.duration, 0)}s
+                  </div>
+                  <button
+                    onClick={() => doAddTLSPhase(junctionId)}
+                    className="w-full px-3 py-1.5 bg-blue-600 text-white rounded text-xs hover:bg-blue-500 mt-2"
+                  >
+                    Add Phase
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <div className="text-gray-400 text-xs">No phases defined</div>
+                  <button
+                    onClick={() => doAddTLSPhase(junctionId)}
+                    className="w-full px-3 py-1.5 bg-blue-600 text-white rounded text-xs hover:bg-blue-500"
+                  >
+                    Add First Phase
+                  </button>
+                </div>
+              )}
+
+              <button
               onClick={() => doSetJunctionType(junctionId, "priority")}
               className="w-full px-3 py-1.5 bg-gray-600 text-white rounded text-xs hover:bg-gray-500"
             >
@@ -86,18 +132,96 @@ export default function TLSEditor({ junctionId }: Props) {
   );
 }
 
-function PhaseRow({ index, phase }: { index: number; phase: TLSPhase }) {
+function PhaseRow({
+  index,
+  phase,
+  junctionId,
+  isSelected,
+  onSelect,
+  onDeselect,
+  onDurationChange,
+  onStateChange,
+  onRemove,
+}: {
+  index: number;
+  phase: TLSPhase;
+  junctionId: string;
+  isSelected: boolean;
+  onSelect: () => void;
+  onDeselect: () => void;
+  onDurationChange: (duration: number) => void;
+  onStateChange: (state: string) => void;
+  onRemove: () => void;
+}) {
+  const [stateDraft, setStateDraft] = React.useState(phase.state);
+
+  React.useEffect(() => {
+    setStateDraft(phase.state);
+  }, [phase.state]);
+
   return (
-    <div className="flex items-center gap-2 bg-gray-700/50 rounded px-2 py-1">
-      <span className="text-gray-400 text-xs w-4">{index}</span>
-      <span className="text-gray-300 text-xs w-8">{phase.duration}s</span>
+    <div
+      className={`rounded px-2 py-1 space-y-1 cursor-pointer transition-colors ${
+        isSelected
+          ? "bg-blue-700/50 border-2 border-blue-500"
+          : "bg-gray-700/50 border-2 border-transparent hover:bg-gray-700/70"
+      }`}
+      onClick={() => (isSelected ? onDeselect() : onSelect())}
+      title={isSelected ? "Click to deselect phase" : "Click to select phase and view connection colors"}
+    >
+      <div className="flex items-center gap-2">
+        <span className="text-gray-400 text-xs w-4">{index}</span>
+        <span className="text-gray-400 text-[11px]">dur</span>
+        <input
+          type="number"
+          min={1}
+          value={phase.duration}
+          onChange={(e) => onDurationChange(Number(e.target.value))}
+          onClick={(e) => e.stopPropagation()}
+          className="bg-gray-800 text-white text-xs px-1.5 py-0.5 rounded border border-gray-600 w-16"
+        />
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onRemove();
+          }}
+          className="ml-auto text-[10px] px-1.5 py-0.5 rounded bg-red-700/80 text-red-100 hover:bg-red-600"
+          title="Remove phase"
+        >
+          Remove
+        </button>
+      </div>
+      <div className="flex items-center gap-2">
+        <span className="text-gray-400 text-[11px] w-8">state</span>
+        <input
+          type="text"
+          value={stateDraft}
+          onChange={(e) => setStateDraft(e.target.value)}
+          onClick={(e) => e.stopPropagation()}
+          onBlur={() => {
+            if (stateDraft !== phase.state) onStateChange(stateDraft);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              if (stateDraft !== phase.state) onStateChange(stateDraft);
+            } else if (e.key === "Escape") {
+              setStateDraft(phase.state);
+            }
+          }}
+          className="bg-gray-800 text-white text-xs px-1.5 py-0.5 rounded border border-gray-600 flex-1 font-mono"
+        />
+      </div>
       <div className="flex gap-px flex-1">
-        {phase.state.split("").map((s, i) => (
+        {phase.state.split("").map((s, linkIndex) => (
           <div
-            key={i}
-            className={`w-3 h-4 rounded-sm ${STATE_COLORS[s] ?? "bg-gray-500"}`}
-            title={`Link ${i}: ${s}`}
-          />
+            key={linkIndex}
+            className={`w-4 h-5 rounded-sm flex items-center justify-center text-[9px] font-bold ${
+              STATE_COLORS[s] ?? "bg-gray-500"
+            } ${s === "G" || s === "g" ? "text-white" : s === "y" ? "text-black" : "text-white"}`}
+            title={`Link ${linkIndex}: ${s}`}
+          >
+            {linkIndex}
+          </div>
         ))}
       </div>
     </div>

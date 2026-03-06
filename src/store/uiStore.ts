@@ -4,6 +4,7 @@ export type EditMode =
   | "inspect"
   | "select"
   | "move"
+  | "draw"
   | "createJunction"
   | "createEdge"
   | "delete"
@@ -31,6 +32,9 @@ interface UIState {
   connectionFromEdge: string | null;
   connectionFromLane: number | null;
 
+  // TLS phase selection: junctionId -> phaseIndex
+  selectedTLSPhase: Map<string, number>;
+
   // Actions
   setEditMode: (mode: EditMode) => void;
   setSelection: (sel: Selection | null) => void;
@@ -38,10 +42,11 @@ interface UIState {
   setCursorPosition: (pos: [number, number] | null) => void;
   setCreateEdgeFromJunction: (id: string | null) => void;
   setConnectionFrom: (edgeId: string | null, laneIdx: number | null) => void;
+  setSelectedTLSPhase: (junctionId: string, phaseIndex: number | null) => void;
   clearModeState: () => void;
 }
 
-export const useUIStore = create<UIState>((set) => ({
+export const useUIStore = create<UIState>((set, get) => ({
   editMode: "inspect",
   selection: null,
   hoverElement: null,
@@ -49,6 +54,7 @@ export const useUIStore = create<UIState>((set) => ({
   createEdgeFromJunction: null,
   connectionFromEdge: null,
   connectionFromLane: null,
+  selectedTLSPhase: new Map<string, number>(),
 
   setEditMode: (mode) =>
     set({
@@ -65,6 +71,15 @@ export const useUIStore = create<UIState>((set) => ({
   setCreateEdgeFromJunction: (id) => set({ createEdgeFromJunction: id }),
   setConnectionFrom: (edgeId, laneIdx) =>
     set({ connectionFromEdge: edgeId, connectionFromLane: laneIdx }),
+  setSelectedTLSPhase: (junctionId, phaseIndex) => {
+    const current = new Map(get().selectedTLSPhase);
+    if (phaseIndex === null) {
+      current.delete(junctionId);
+    } else {
+      current.set(junctionId, phaseIndex);
+    }
+    set({ selectedTLSPhase: current });
+  },
   clearModeState: () =>
     set({
       createEdgeFromJunction: null,

@@ -3,16 +3,17 @@
 import React, { useCallback, useMemo, useRef, useEffect } from "react";
 import { Map } from "react-map-gl/maplibre";
 import DeckGL from "@deck.gl/react";
-import { PathLayer, PolygonLayer, ScatterplotLayer } from "@deck.gl/layers";
+import { PathLayer, PolygonLayer, ScatterplotLayer, TextLayer } from "@deck.gl/layers";
 import type { MapViewState, PickingInfo } from "@deck.gl/core";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 import { useNetworkStore } from "@/store/networkStore";
 import { useUIStore } from "@/store/uiStore";
-import { COLORS } from "@/lib/sumo/colors";
+import { COLORS, type RGBA } from "@/lib/sumo/colors";
 import type {
   RenderableJunction,
   RenderableConnection,
+  XY,
 } from "@/lib/sumo/types";
 
 type DeckPath = [number, number][];
@@ -39,14 +40,26 @@ export default function NetworkMap() {
   const createEdgeFromJunction = useUIStore((s) => s.createEdgeFromJunction);
   const connectionFromEdge = useUIStore((s) => s.connectionFromEdge);
   const connectionFromLane = useUIStore((s) => s.connectionFromLane);
+  const cursorPosition = useUIStore((s) => s.cursorPosition);
+  const selectedTLSPhase = useUIStore((s) => s.selectedTLSPhase);
   const setSelection = useUIStore((s) => s.setSelection);
   const setHoverElement = useUIStore((s) => s.setHoverElement);
   const setCursorPosition = useUIStore((s) => s.setCursorPosition);
   const setCreateEdgeFromJunction = useUIStore((s) => s.setCreateEdgeFromJunction);
   const setConnectionFrom = useUIStore((s) => s.setConnectionFrom);
+  const setEditMode = useUIStore((s) => s.setEditMode);
 
   const [viewState, setViewState] = React.useState<MapViewState>(INITIAL_VIEW);
   const dragRef = useRef<{ edgeId: string; pointIndex: number } | null>(null);
+  const drawClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [drawDraft, setDrawDraft] = React.useState<{
+    startJunctionId: string;
+    startPos: XY;
+    via: XY[];
+  } | null>(null);
+  const lastClickTimeRef = useRef<number>(0);
+  const lastClickCoordRef = useRef<[number, number] | null>(null);
+  const lastClickJunctionIdRef = useRef<string | undefined>(undefined);
 
   // Center map on network when loaded
   useEffect(() => {
@@ -59,6 +72,24 @@ export default function NetworkMap() {
       }));
     }
   }, [renderable?.center[0], renderable?.center[1]]);
+
+  useEffect(() => {
+    if (editMode !== "draw") {
+      setDrawDraft(null);
+      if (drawClickTimerRef.current) {
+        clearTimeout(drawClickTimerRef.current);
+        drawClickTimerRef.current = null;
+      }
+    }
+  }, [editMode]);
+
+  useEffect(() => {
+    return () => {
+      if (drawClickTimerRef.current) {
+        clearTimeout(drawClickTimerRef.current);
+      }
+    };
+  }, []);
 
   // ─── Layers ───
 
@@ -133,31 +164,57 @@ export default function NetworkMap() {
     [renderable?.junctions, selection, hoverElement, editMode]
   );
 
+  // Helper function to get connection color based on selected TLS phase
+  const getConnectionColor = useCallback(
+    (conn: RenderableConnection): RGBA => {
+      const isSelected =
+        selection?.type === "connection" &&
+        selection.id === `${conn.from}_${conn.fromLane}-${conn.to}_${conn.toLane}`;
+      if (isSelected) return COLORS.connectionSelected;
+
+      // If connection has a traffic light and a phase is selected, color by phase state
+      if (conn.tl && network) {
+        const phaseIndex = selectedTLSPhase.get(conn.tl);
+        if (phaseIndex !== undefined) {
+          const tls = network.tlLogics.find((t) => t.id === conn.tl);
+          if (tls && tls.phases[phaseIndex] && conn.linkIndex >= 0) {
+            const phaseState = tls.phases[phaseIndex].state;
+            const stateChar = phaseState[conn.linkIndex];
+            if (stateChar) {
+              // Color based on state: G/g = green, y = yellow, r/s = red, o/O = orange
+              if (stateChar === "G" || stateChar === "g") return COLORS.tlsGreen;
+              if (stateChar === "y") return COLORS.tlsYellow;
+              if (stateChar === "r" || stateChar === "s") return COLORS.tlsRed;
+              if (stateChar === "o" || stateChar === "O") return [255, 165, 0, 255] as RGBA;
+            }
+          }
+        }
+      }
+
+      return COLORS.connection;
+    },
+    [selection, network, selectedTLSPhase]
+  );
+
   const connectionLayer = useMemo(
     () =>
       new PathLayer({
         id: "connections",
         data: renderable?.connections ?? [],
         getPath: (d: RenderableConnection) => d.path as unknown as DeckPath,
-        getWidth: 0.8,
-        getColor: (d: RenderableConnection) => {
-          const isSelected =
-            selection?.type === "connection" &&
-            selection.id === `${d.from}_${d.fromLane}-${d.to}_${d.toLane}`;
-          if (isSelected) return COLORS.connectionSelected;
-          return COLORS.connection;
-        },
+        getWidth: 1.2,
+        getColor: (d: RenderableConnection) => getConnectionColor(d) as any,
         widthUnits: "meters" as const,
         widthMinPixels: 1,
-        pickable: editMode === "connection" || editMode === "inspect",
+        pickable: editMode === "connection" || editMode === "inspect" || editMode === "tls",
         visible: editMode === "connection" || editMode === "inspect" || editMode === "tls",
         getDashArray: [4, 2],
         dashJustified: true,
         updateTriggers: {
-          getColor: [selection],
+          getColor: [selection, selectedTLSPhase],
         },
       }),
-    [renderable?.connections, selection, editMode]
+    [renderable?.connections, selection, editMode, getConnectionColor, selectedTLSPhase]
   );
 
   // Geometry points for selected edge (in move mode)
@@ -188,14 +245,308 @@ export default function NetworkMap() {
     [geometryPoints]
   );
 
-  const layers = [laneLayer, junctionLayer, connectionLayer, geometryPointLayer];
+  // Helper function to calculate the geometric midpoint along a polyline path
+  const getPathMidpoint = useCallback((path: [number, number][]): [number, number] => {
+    if (path.length === 0) return [0, 0];
+    if (path.length === 1) return path[0];
+    if (path.length === 2) {
+      // Simple midpoint between two points
+      return [
+        (path[0][0] + path[1][0]) / 2,
+        (path[0][1] + path[1][1]) / 2,
+      ];
+    }
+
+    // Calculate cumulative distances along the path
+    const distances: number[] = [0];
+    let totalDistance = 0;
+    for (let i = 1; i < path.length; i++) {
+      const dx = path[i][0] - path[i - 1][0];
+      const dy = path[i][1] - path[i - 1][1];
+      const segmentLength = Math.sqrt(dx * dx + dy * dy);
+      totalDistance += segmentLength;
+      distances.push(totalDistance);
+    }
+
+    // Find the midpoint (half the total distance)
+    const targetDistance = totalDistance / 2;
+    
+    // Find which segment contains the midpoint
+    for (let i = 1; i < distances.length; i++) {
+      if (distances[i] >= targetDistance) {
+        // Interpolate within this segment
+        const segmentStart = distances[i - 1];
+        const segmentLength = distances[i] - segmentStart;
+        const t = (targetDistance - segmentStart) / segmentLength;
+        
+        return [
+          path[i - 1][0] + t * (path[i][0] - path[i - 1][0]),
+          path[i - 1][1] + t * (path[i][1] - path[i - 1][1]),
+        ];
+      }
+    }
+
+    // Fallback to last point
+    return path[path.length - 1];
+  }, []);
+
+  // Connection linkIndex labels (only show in TLS mode)
+  const connectionLabels = useMemo(() => {
+    if (editMode !== "tls" || !renderable?.connections) return [];
+    return renderable.connections
+      .filter((conn) => conn.tl && conn.linkIndex >= 0 && conn.path.length > 0)
+      .map((conn) => {
+        // Calculate geometric midpoint of connection path
+        const position = getPathMidpoint(conn.path as [number, number][]);
+        return {
+          position,
+          text: conn.linkIndex.toString(),
+          linkIndex: conn.linkIndex,
+          tl: conn.tl,
+        };
+      });
+  }, [renderable?.connections, editMode, getPathMidpoint]);
+
+  const connectionLabelLayer = useMemo(
+    () =>
+      new TextLayer({
+        id: "connection-labels",
+        data: connectionLabels,
+        getPosition: (d: any) => d.position,
+        getText: (d: any) => d.text,
+        getColor: [255, 255, 255, 255] as any,
+        getSize: 12,
+        getAngle: 0,
+        getTextAnchor: "middle",
+        getAlignmentBaseline: "center",
+        fontFamily: "monospace",
+        fontWeight: "bold",
+        sizeScale: 1,
+        sizeMinPixels: 10,
+        sizeMaxPixels: 20,
+        pickable: false,
+        visible: editMode === "tls",
+      }),
+    [connectionLabels, editMode]
+  );
+
+  const drawPreviewPath = useMemo(() => {
+    if (editMode !== "draw" || !drawDraft || !projection) return [];
+    const shape: XY[] = [drawDraft.startPos, ...drawDraft.via];
+    if (cursorPosition) {
+      shape.push(projection.lngLatToSumo(cursorPosition));
+    }
+    if (shape.length < 2) return [];
+    return [{ path: projection.sumoShapeToLngLat(shape) }];
+  }, [editMode, drawDraft, projection, cursorPosition]);
+
+  const drawPreviewLayer = useMemo(
+    () =>
+      new PathLayer({
+        id: "draw-preview",
+        data: drawPreviewPath,
+        getPath: (d: any) => d.path as unknown as DeckPath,
+        getWidth: 1.2,
+        getColor: [255, 165, 0, 220],
+        widthUnits: "meters" as const,
+        widthMinPixels: 3,
+        capRounded: true,
+        jointRounded: true,
+        pickable: false,
+        visible: editMode === "draw",
+      }),
+    [drawPreviewPath, editMode]
+  );
+
+  const drawVertexLayer = useMemo(() => {
+    if (editMode !== "draw" || !drawDraft || !projection) {
+      return new ScatterplotLayer({
+        id: "draw-vertices",
+        data: [],
+        visible: false,
+      });
+    }
+    const points = [drawDraft.startPos, ...drawDraft.via].map((pt, i) => ({
+      position: projection.sumoToLngLat(pt),
+      isStart: i === 0,
+    }));
+    return new ScatterplotLayer({
+      id: "draw-vertices",
+      data: points,
+      getPosition: (d: any) => d.position,
+      getRadius: (d: any) => (d.isStart ? 5 : 3.5),
+      getFillColor: (d: any) => (d.isStart ? [59, 130, 246, 220] : [251, 191, 36, 220]),
+      radiusUnits: "meters" as const,
+      radiusMinPixels: 5,
+      pickable: false,
+      visible: true,
+    });
+  }, [editMode, drawDraft, projection]);
+
+  const layers = [
+    laneLayer,
+    junctionLayer,
+    connectionLayer,
+    connectionLabelLayer,
+    geometryPointLayer,
+    drawPreviewLayer,
+    drawVertexLayer,
+  ];
 
   // ─── Interaction handlers ───
+
+  const handleDrawSingleClick = useCallback(
+    (coordinate: [number, number], clickedJunctionId?: string) => {
+      let activeProjection = projection;
+      if (!network || !activeProjection) {
+        store.getState().createNew(coordinate[0], coordinate[1]);
+        const st = store.getState();
+        activeProjection = st.projection;
+      }
+      if (!activeProjection) return;
+      const sumoPos = activeProjection.lngLatToSumo([coordinate[0], coordinate[1]]);
+
+      if (!drawDraft) {
+        // Starting a new edge
+        let startId: string | null = null;
+        let startPos: XY;
+        
+        if (clickedJunctionId) {
+          // Use existing junction
+          const junction = network?.junctions.get(clickedJunctionId);
+          if (junction) {
+            startId = clickedJunctionId;
+            startPos = [junction.x, junction.y];
+          }
+        }
+        
+        if (!startId) {
+          // Create new junction
+          startId = store.getState().doAddJunction(sumoPos[0], sumoPos[1]);
+          if (!startId) return;
+          startPos = sumoPos;
+        }
+        
+        setDrawDraft({
+          startJunctionId: startId,
+          startPos,
+          via: [],
+        });
+        setSelection({ type: "junction", id: startId });
+        return;
+      }
+
+      // Adding a geometry point (via point)
+      setDrawDraft((prev) =>
+        prev
+          ? {
+              ...prev,
+              via: [...prev.via, sumoPos],
+            }
+          : prev
+      );
+    },
+    [network, projection, drawDraft, setSelection]
+  );
+
+  const finalizeDraw = useCallback(
+    (coordinate: [number, number], clickedJunctionId?: string) => {
+      if (!drawDraft) return;
+      const activeProjection = projection ?? store.getState().projection;
+      if (!activeProjection) return;
+      const st = store.getState();
+      
+      let edgeId: string | null = null;
+      
+      if (clickedJunctionId && network) {
+        // Ending on an existing junction - use doAddEdge
+        edgeId = st.doAddEdge(drawDraft.startJunctionId, clickedJunctionId);
+        // If there are via points, we need to update the edge geometry
+        if (edgeId && drawDraft.via.length > 0 && network) {
+          const edge = network.edges.get(edgeId);
+          if (edge) {
+            // Add via points as geometry points
+            drawDraft.via.forEach((viaPoint, idx) => {
+              st.doAddGeometryPoint(edgeId!, idx, viaPoint);
+            });
+          }
+        }
+      } else {
+        // Ending at a new location - create new junction and edge
+        const endPos = activeProjection.lngLatToSumo([coordinate[0], coordinate[1]]);
+        edgeId = st.doDrawEdgeFromJunction(drawDraft.startJunctionId, endPos, drawDraft.via);
+      }
+      
+      if (edgeId) {
+        setSelection({ type: "edge", id: edgeId });
+        // Automatically trigger compute network (F5) after drawing finishes
+        st.doComputeNetwork();
+      }
+      setDrawDraft(null);
+      // Exit draw mode after finalizing the edge
+      setEditMode("inspect");
+    },
+    [drawDraft, projection, network, setSelection, setEditMode]
+  );
 
   const handleClick = useCallback(
     (info: PickingInfo) => {
       const { coordinate } = info;
       if (!coordinate) return;
+
+      if (editMode === "draw") {
+        const clickCoord: [number, number] = [coordinate[0], coordinate[1]];
+        // Check if user clicked on an existing junction
+        const clickedJunctionId = info.layer?.id === "junctions" 
+          ? (info.object as any)?.id 
+          : undefined;
+        
+        const now = Date.now();
+        const timeSinceLastClick = now - lastClickTimeRef.current;
+        const lastCoord = lastClickCoordRef.current;
+        const lastJunctionId = lastClickJunctionIdRef.current;
+        
+        // Check if this is a double-click (within 300ms and similar position)
+        const isDoubleClick = 
+          timeSinceLastClick < 300 &&
+          lastCoord &&
+          Math.abs(clickCoord[0] - lastCoord[0]) < 0.0001 &&
+          Math.abs(clickCoord[1] - lastCoord[1]) < 0.0001 &&
+          clickedJunctionId === lastJunctionId; // Same junction or both empty space
+        
+        if (isDoubleClick) {
+          // Clear any pending single-click timer
+          if (drawClickTimerRef.current) {
+            clearTimeout(drawClickTimerRef.current);
+            drawClickTimerRef.current = null;
+          }
+          // Reset click tracking
+          lastClickTimeRef.current = 0;
+          lastClickCoordRef.current = null;
+          lastClickJunctionIdRef.current = undefined;
+          // Handle as double-click: finalize the draw
+          finalizeDraw(clickCoord, clickedJunctionId);
+          return;
+        }
+        
+        // Store this click for potential double-click detection
+        lastClickTimeRef.current = now;
+        lastClickCoordRef.current = clickCoord;
+        lastClickJunctionIdRef.current = clickedJunctionId;
+        
+        // Set timer for single-click (longer delay to allow double-click detection)
+        if (drawClickTimerRef.current) {
+          clearTimeout(drawClickTimerRef.current);
+        }
+        drawClickTimerRef.current = setTimeout(() => {
+          handleDrawSingleClick(clickCoord, clickedJunctionId);
+          drawClickTimerRef.current = null;
+          lastClickTimeRef.current = 0;
+          lastClickCoordRef.current = null;
+          lastClickJunctionIdRef.current = undefined;
+        }, 300);
+        return;
+      }
 
       // Auto-create a network if none exists and user is in a creation mode
       if (!network || !projection) {
@@ -220,7 +571,7 @@ export default function NetworkMap() {
             setSelection({ type: "junction", id: (info.object as any).id });
           } else if (info.layer?.id === "lanes") {
             const obj = info.object as any;
-            setSelection({ type: "edge", id: obj.edgeId, subId: obj.id });
+            setSelection({ type: "lane", id: obj.id, subId: obj.edgeId });
           } else if (info.layer?.id === "connections") {
             const obj = info.object as RenderableConnection;
             setSelection({
@@ -313,7 +664,30 @@ export default function NetworkMap() {
       setSelection,
       setCreateEdgeFromJunction,
       setConnectionFrom,
+      handleDrawSingleClick,
+      finalizeDraw,
     ]
+  );
+
+  const handleMapDblClick = useCallback(
+    (evt: any) => {
+      if (editMode !== "draw") return;
+      evt?.preventDefault?.();
+      // Clear any pending single-click timer
+      if (drawClickTimerRef.current) {
+        clearTimeout(drawClickTimerRef.current);
+        drawClickTimerRef.current = null;
+      }
+      // Reset click tracking
+      lastClickTimeRef.current = 0;
+      lastClickCoordRef.current = null;
+      
+      const lng = evt?.lngLat?.lng;
+      const lat = evt?.lngLat?.lat;
+      if (typeof lng !== "number" || typeof lat !== "number") return;
+      finalizeDraw([lng, lat]);
+    },
+    [editMode, finalizeDraw]
   );
 
   const handleHover = useCallback(
@@ -377,6 +751,8 @@ export default function NetworkMap() {
       switch (editMode) {
         case "createJunction":
           return "crosshair";
+        case "draw":
+          return "crosshair";
         case "createEdge":
           return createEdgeFromJunction ? "crosshair" : "pointer";
         case "delete":
@@ -396,7 +772,10 @@ export default function NetworkMap() {
     <DeckGL
       viewState={viewState}
       onViewStateChange={({ viewState: vs }: { viewState: MapViewState }) => setViewState(vs)}
-      controller={{ dragPan: editMode !== "move" || (!selection && !dragRef.current) }}
+      controller={{
+        dragPan: editMode !== "move" || (!selection && !dragRef.current),
+        doubleClickZoom: editMode !== "draw",
+      }}
       layers={layers}
       onClick={handleClick}
       onHover={handleHover}
@@ -406,7 +785,7 @@ export default function NetworkMap() {
       getCursor={getCursor}
       pickingRadius={5}
     >
-      <Map mapStyle={MAP_STYLE} />
+      <Map mapStyle={MAP_STYLE} onDblClick={handleMapDblClick} />
     </DeckGL>
   );
 }
