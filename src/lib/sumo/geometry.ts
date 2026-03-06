@@ -173,3 +173,57 @@ export function interpolatePolyline(shape: XY[], targetDist: number): XY {
 
   return shape[shape.length - 1];
 }
+
+/**
+ * Generate a smooth bezier curve between two points with 8 control points.
+ * Uses a cubic bezier curve with control points based on the directions at start and end.
+ * 
+ * @param p0 Start point
+ * @param p1 End point
+ * @param dir0 Direction at start (normalized vector)
+ * @param dir1 Direction at end (normalized vector)
+ * @param numPoints Number of points to generate (default: 8)
+ * @returns Array of points along the bezier curve
+ */
+export function bezierCurve(
+  p0: XY,
+  p1: XY,
+  dir0: XY,
+  dir1: XY,
+  numPoints: number = 8
+): XY[] {
+  // Calculate distance between points
+  const d = dist(p0, p1);
+  
+  // Control point distance is proportional to the connection length
+  // Use 1/3 of the distance for smooth curves
+  const controlDist = d * 0.33;
+  
+  // First control point: extend from p0 in dir0 direction
+  const cp1: XY = add(p0, scale(dir0, controlDist));
+  
+  // Second control point: extend backwards from p1 in opposite of dir1 direction
+  const cp2: XY = add(p1, scale(dir1, -controlDist));
+  
+  // Generate points along the cubic bezier curve
+  // Cubic bezier: B(t) = (1-t)³P₀ + 3(1-t)²tP₁ + 3(1-t)t²P₂ + t³P₃
+  // where P₀=p0, P₁=cp1, P₂=cp2, P₃=p1
+  const points: XY[] = [];
+  
+  for (let i = 0; i < numPoints; i++) {
+    const t = i / (numPoints - 1); // t from 0 to 1
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const mt = 1 - t;
+    const mt2 = mt * mt;
+    const mt3 = mt2 * mt;
+    
+    // Cubic bezier formula
+    const x = mt3 * p0[0] + 3 * mt2 * t * cp1[0] + 3 * mt * t2 * cp2[0] + t3 * p1[0];
+    const y = mt3 * p0[1] + 3 * mt2 * t * cp1[1] + 3 * mt * t2 * cp2[1] + t3 * p1[1];
+    
+    points.push([x, y]);
+  }
+  
+  return points;
+}
