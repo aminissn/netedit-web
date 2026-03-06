@@ -104,12 +104,12 @@ export function moveJunction(
   network.edges.forEach((edge) => {
     if (edge.from === junctionId && edge.shape.length > 0) {
       edge.shape[0] = [edge.shape[0][0] + dx, edge.shape[0][1] + dy];
-      recomputeLaneShapes(edge, network);
+      // Do NOT compute lane shapes here - netconvert will compute them
     }
     if (edge.to === junctionId && edge.shape.length > 0) {
       const last = edge.shape.length - 1;
       edge.shape[last] = [edge.shape[last][0] + dx, edge.shape[last][1] + dy];
-      recomputeLaneShapes(edge, network);
+      // Do NOT compute lane shapes here - netconvert will compute them
     }
   });
 
@@ -180,10 +180,8 @@ export function addEdge(
 
   network.edges.set(id, edge);
 
-  // Recompute lane shapes with proper endpoint snapping to junction centers
-  recomputeLaneShapes(edge, network);
-
-  // Do NOT guess connections here - netconvert will compute them
+  // Do NOT compute shapes here - netconvert will compute them
+  // Shapes are only computed by netconvert and parsed from its output
   // Connections are only computed by netconvert and parsed from its output
 
   return edge;
@@ -210,23 +208,40 @@ export function setEdgeAttribute(
     case "numLanes": {
       const newNum = Math.max(1, Math.min(10, Number(value)));
       if (newNum === edge.numLanes) return;
+      const oldNum = edge.numLanes;
       edge.numLanes = newNum;
-      // Rebuild lanes
-      edge.lanes = [];
-      for (let i = 0; i < newNum; i++) {
-        edge.lanes.push({
-          id: `${edgeId}_${i}`,
-          index: i,
-          speed: edge.speed,
-          length: 0, // Will be set by recomputeLaneShapes
-          width: SUMO_DEFAULT_LANE_WIDTH,
-          allow: "",
-          disallow: "",
-          shape: [], // Will be set by recomputeLaneShapes
-        });
+      
+      if (newNum > oldNum) {
+        // Adding lanes: preserve existing lanes (0 to oldNum-1) and add new ones to the left (oldNum to newNum-1)
+        // Lane 0 is always rightmost, higher indices are to the left
+        for (let i = oldNum; i < newNum; i++) {
+          edge.lanes.push({
+            id: `${edgeId}_${i}`,
+            index: i,
+            speed: edge.speed,
+            length: 0, // Will be set by recomputeLaneShapes
+            width: SUMO_DEFAULT_LANE_WIDTH,
+            allow: "",
+            disallow: "",
+            shape: [], // Will be set by recomputeLaneShapes
+          });
+        }
+      } else {
+        // Removing lanes: keep lanes 0 to newNum-1, remove lanes newNum to oldNum-1 (from the left)
+        edge.lanes = edge.lanes.filter((lane) => lane.index < newNum);
       }
-      // Recompute lane shapes with proper endpoint snapping
-      recomputeLaneShapes(edge, network);
+      
+      // Ensure all lanes have correct indices (in case of any inconsistencies)
+      edge.lanes.forEach((lane, idx) => {
+        lane.index = idx;
+        lane.id = `${edgeId}_${idx}`;
+        // Keep shapes empty - netconvert will compute them
+        if (!lane.shape || lane.shape.length === 0) {
+          lane.shape = [];
+        }
+      });
+      
+      // Do NOT compute shapes here - netconvert will compute them
       // Remove connections involving this edge - they will be recomputed by netconvert
       network.connections = network.connections.filter(
         (c) => c.from !== edgeId && c.to !== edgeId
@@ -252,7 +267,7 @@ export function setEdgeAttribute(
       break;
     case "spreadType":
       edge.spreadType = "right";
-      recomputeLaneShapes(edge, network);
+      // Do NOT compute shapes here - netconvert will compute them
       break;
   }
 }
@@ -308,7 +323,7 @@ export function moveEdgeGeometryPoint(
   const edge = network.edges.get(edgeId);
   if (!edge || pointIndex < 0 || pointIndex >= edge.shape.length) return;
   edge.shape[pointIndex] = newPos;
-  recomputeLaneShapes(edge, network);
+  // Do NOT compute lane shapes here - netconvert will compute them
 }
 
 export function addEdgeGeometryPoint(
@@ -320,7 +335,7 @@ export function addEdgeGeometryPoint(
   const edge = network.edges.get(edgeId);
   if (!edge) return;
   edge.shape.splice(afterIndex + 1, 0, pos);
-  recomputeLaneShapes(edge, network);
+  // Do NOT compute lane shapes here - netconvert will compute them
 }
 
 export function removeEdgeGeometryPoint(
@@ -332,7 +347,7 @@ export function removeEdgeGeometryPoint(
   if (!edge || edge.shape.length <= 2) return; // Must keep at least 2 points
   if (pointIndex <= 0 || pointIndex >= edge.shape.length - 1) return; // Don't remove endpoints
   edge.shape.splice(pointIndex, 1);
-  recomputeLaneShapes(edge, network);
+  // Do NOT compute lane shapes here - netconvert will compute them
 }
 
 // ─── Connection mutations ───
@@ -544,19 +559,59 @@ function getTrimmedEdgeShape(
   return shape;
 }
 
+/**
+ * Return a trimmed copy of the lane shape so it stops at junction boundaries
+ * instead of extending to junction centers. Uses the lane shape from netconvert.
+ */
+function getTrimmedLaneShape(
+  lane: SUMOLane,
+  edge: SUMOEdge,
+  junctions: Map<string, SUMOJunction>,
+  allEdges: Map<string, SUMOEdge>
+): XY[] {
+  // Use lane shape from netconvert (stored in lane.shape)
+  // If shape is empty or missing, fall back to computing from edge shape (for backwards compatibility)
+  if (!lane.shape || lane.shape.length === 0) {
+    const trimmedEdgeShape = getTrimmedEdgeShape(edge, junctions, allEdges);
+    return computeLaneShape(trimmedEdgeShape, lane.index, edge.numLanes, edge.spreadType);
+  }
+
+  // Trim the lane shape from netconvert to stop at junction boundaries
+  if (lane.shape.length < 2) return lane.shape;
+
+  let shape = [...lane.shape.map((p) => [...p] as XY)];
+
+  const fromJ = junctions.get(edge.from);
+  const toJ = junctions.get(edge.to);
+
+  const fromSetback = fromJ ? computeSetback(fromJ, edge, allEdges) : 0;
+  const toSetback = toJ ? computeSetback(toJ, edge, allEdges) : 0;
+
+  if (fromSetback > 0) {
+    shape = trimPolylineStart(shape, fromSetback);
+  }
+  if (toSetback > 0) {
+    shape = trimPolylineEnd(shape, toSetback);
+  }
+
+  return shape;
+}
+
 // ─── Build renderable network ───
 
 export function buildRenderableNetwork(network: SUMONetwork): RenderableNetwork {
   const proj = createProjection(network.location);
 
-  // Pre-compute trimmed lane shapes for all edges (used for both rendering and connections)
+  // Use lane shapes directly from netconvert output (stored in lane.shape)
+  // Only trim them for rendering to stop at junction boundaries
   const trimmedLaneShapes = new Map<string, XY[]>();
   const trimmedEdgeShapes = new Map<string, XY[]>();
   network.edges.forEach((edge) => {
     const trimmedShape = getTrimmedEdgeShape(edge, network.junctions, network.edges);
     trimmedEdgeShapes.set(edge.id, trimmedShape);
     for (const lane of edge.lanes) {
-      const trimmedLaneShape = computeLaneShape(trimmedShape, lane.index, edge.numLanes, edge.spreadType);
+      // Use lane shape from netconvert, not recompute it
+      const trimmedLaneShape = getTrimmedLaneShape(lane, edge, network.junctions, network.edges);
       trimmedLaneShapes.set(lane.id, trimmedLaneShape);
     }
   });
@@ -947,59 +1002,35 @@ function rebuildWalkingAreas(network: SUMONetwork): void {
  * Update edge geometry after network computation.
  * Equivalent to edge->updateGeometry()
  */
+/**
+ * @deprecated This function should NOT be used.
+ * All geometry computation is done by netconvert.
+ * The frontend should only update data structures and let netconvert compute shapes.
+ */
 function updateEdgeGeometry(network: SUMONetwork): void {
-  // Ensure all edges have valid geometry
-  network.edges.forEach((edge) => {
-    // Ensure edge endpoints are at junction centers
-    const fromJ = network.junctions.get(edge.from);
-    const toJ = network.junctions.get(edge.to);
-
-    if (fromJ && edge.shape.length > 0) {
-      const distFromJ = dist(edge.shape[0], [fromJ.x, fromJ.y]);
-      if (distFromJ > 0.01) {
-        edge.shape[0] = [fromJ.x, fromJ.y];
-      }
-    }
-
-    if (toJ && edge.shape.length > 0) {
-      const lastIdx = edge.shape.length - 1;
-      const distToJ = dist(edge.shape[lastIdx], [toJ.x, toJ.y]);
-      if (distToJ > 0.01) {
-        edge.shape[lastIdx] = [toJ.x, toJ.y];
-      }
-    }
-
-    // Recompute lane shapes
-    recomputeLaneShapes(edge, network);
-  });
+  // NO-OP: All geometry computation is done by netconvert
+  // This function is kept for backwards compatibility but does nothing
 }
 
 /**
- * Recompute basic network geometry for UI display.
- * 
- * NOTE: This function does NOT compute connections or shapes - those are computed by netconvert.
- * This function only does minimal geometry updates needed for UI rendering before netconvert runs.
+ * @deprecated This function should NOT be used.
+ * All network computation (shapes, connections, geometry) is done by netconvert.
+ * The frontend should only:
+ * 1. Update data structures (add/remove elements, change attributes)
+ * 2. Send patches to netconvert
+ * 3. Parse netconvert output to get computed shapes and connections
  * 
  * IMPORTANT: 
  * - Connections are ONLY computed by netconvert and parsed from its output
  * - Node shapes are ONLY computed by netconvert and parsed from its output
  * - Edge/lane shapes are ONLY computed by netconvert and parsed from its output
- * - This function only ensures basic consistency (edge endpoints at junctions, lane shape snapping)
  * 
  * Edge shapes in the network data structure ALWAYS extend to junction centers.
  * Edge trimming only happens during rendering in buildRenderableNetwork().
  */
 export function computeNetwork(network: SUMONetwork): void {
-  // Only do minimal geometry updates - all real computation is done by netconvert
-  // Step 1: Remove self loops
-  removeSelfLoops(network);
-
-  // Step 2: Ensure edge endpoints are at junction centers and recompute lane shapes
-  // This is only for UI consistency - netconvert will recompute everything
-  updateEdgeGeometry(network);
-
-  // Do NOT compute connections, node shapes, or logics here - netconvert does that
-  // Connections and shapes come from netconvert output only
+  // NO-OP: All computation is done by netconvert
+  // This function is kept for backwards compatibility but does nothing
 }
 
 /**

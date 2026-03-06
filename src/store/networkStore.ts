@@ -638,20 +638,26 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
           tllXML?: string;
         };
 
-        if (baseNetXML && hasDirty) {
-          // Patch mode: send base + only changed elements
-          payload = { baseNetXML };
-          const nodPatch = exportPatchNodXML(network, dirtyNodes);
-          const edgPatch = exportPatchEdgXML(network, dirtyEdges);
-          const tllPatch = exportPatchTllXML(network, dirtyTLS);
-          if (nodPatch) payload.nodXML = nodPatch;
-          if (edgPatch) payload.edgXML = edgPatch;
-          if (hasConnectionChanges) {
-            payload.conXML = exportPatchConXML(resetConnectionEdges, resetConnectionSnapshots, addedConnections, removedConnections, network);
+        if (baseNetXML) {
+          // Always use the original uploaded file as base when it exists
+          if (hasDirty) {
+            // Patch mode: send original base + only changed elements
+            payload = { baseNetXML };
+            const nodPatch = exportPatchNodXML(network, dirtyNodes);
+            const edgPatch = exportPatchEdgXML(network, dirtyEdges);
+            const tllPatch = exportPatchTllXML(network, dirtyTLS);
+            if (nodPatch) payload.nodXML = nodPatch;
+            if (edgPatch) payload.edgXML = edgPatch;
+            if (hasConnectionChanges) {
+              payload.conXML = exportPatchConXML(resetConnectionEdges, resetConnectionSnapshots, addedConnections, removedConnections, network);
+            }
+            if (tllPatch) payload.tllXML = tllPatch;
+          } else {
+            // No changes: just use the original base file (no patches)
+            payload = { baseNetXML };
           }
-          if (tllPatch) payload.tllXML = tllPatch;
         } else {
-          // Full mode: no base or nothing dirty — send full network
+          // Full mode: no original base (new network) — send full network
           payload = { baseNetXML: exportNetXML(snapshot) };
         }
 
@@ -659,7 +665,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         const computedNetwork = parseNetXML(computedXml);
         pushSnapshot(snapshot);
         setCurrentNetwork(computedNetwork);
-        set({ isComputing: false, computeError: null, baseNetXML: computedXml });
+        // Keep baseNetXML unchanged - it should always be the original uploaded file
+        set({ isComputing: false, computeError: null });
         clearDirty();
       } catch (error: unknown) {
         const message =
