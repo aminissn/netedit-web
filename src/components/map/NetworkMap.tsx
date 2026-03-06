@@ -206,8 +206,8 @@ export default function NetworkMap() {
         getColor: (d: RenderableConnection) => getConnectionColor(d) as any,
         widthUnits: "meters" as const,
         widthMinPixels: 1,
-        pickable: editMode === "connection" || editMode === "inspect" || editMode === "tls",
-        visible: editMode === "connection" || editMode === "inspect" || editMode === "tls",
+        pickable: editMode === "connection" || editMode === "inspect" || editMode === "tls" || editMode === "delete",
+        visible: editMode === "connection" || editMode === "inspect" || editMode === "tls" || editMode === "delete",
         getDashArray: [4, 2],
         dashJustified: true,
         updateTriggers: {
@@ -609,6 +609,9 @@ export default function NetworkMap() {
             store.getState().doRemoveJunction((info.object as any).id);
           } else if (info.layer?.id === "lanes") {
             store.getState().doRemoveEdge((info.object as any).edgeId);
+          } else if (info.layer?.id === "connections") {
+            const obj = info.object as RenderableConnection;
+            store.getState().doRemoveConnection(obj.from, obj.to, obj.fromLane, obj.toLane);
           }
           setSelection(null);
           break;
