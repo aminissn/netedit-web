@@ -5,19 +5,16 @@ import { useUIStore } from "@/store/uiStore";
 import { useNetworkStore } from "@/store/networkStore";
 
 const MODE_HINTS: Record<string, string> = {
-  inspect: "Click elements to inspect properties",
-  select: "Click to select elements",
-  move: "Click and drag junctions or geometry points",
+  inspect: "Click elements to inspect, drag to move, delete button in panel",
   draw: "Click to place start node, click to add geometry points, double-click to finish edge",
-  createJunction: "Click on the map to create a junction",
   createEdge: "Click a junction to start, click another to create edge",
-  delete: "Click elements to delete them",
   connection: "Click a lane to set source, click another to connect",
   tls: "Click a junction to edit traffic light signals",
 };
 
 export default function StatusBar() {
   const editMode = useUIStore((s) => s.editMode);
+  const drawSubMode = useUIStore((s) => s.drawSubMode);
   const cursorPosition = useUIStore((s) => s.cursorPosition);
   const createEdgeFromJunction = useUIStore((s) => s.createEdgeFromJunction);
   const connectionFromEdge = useUIStore((s) => s.connectionFromEdge);
@@ -29,8 +26,14 @@ export default function StatusBar() {
   if (editMode === "createEdge" && createEdgeFromJunction) {
     hint = `From: ${createEdgeFromJunction} - Click destination junction`;
   }
-  if (editMode === "connection" && connectionFromEdge) {
-    hint = `From: ${connectionFromEdge} - Click destination lane`;
+  if (editMode === "draw" && drawSubMode === "connection") {
+    if (connectionFromEdge) {
+      hint = `From: ${connectionFromEdge} - Click destination lane`;
+    } else {
+      hint = "Click a lane to set source, click another to connect";
+    }
+  } else if (editMode === "draw" && drawSubMode === "road") {
+    hint = "Click to place start node, click to add geometry points, double-click to finish edge";
   }
 
   const stats = network

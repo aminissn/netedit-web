@@ -35,10 +35,7 @@ export default function Home() {
         e.preventDefault();
         redo();
       }
-      if (e.key === "F5") {
-        e.preventDefault();
-        void doComputeNetwork();
-      }
+      // F5 compute removed - compute is now automatic on mode switch
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);

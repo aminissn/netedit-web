@@ -1,15 +1,13 @@
 import { create } from "zustand";
+import { useNetworkStore } from "./networkStore";
 
 export type EditMode =
   | "inspect"
-  | "select"
-  | "move"
   | "draw"
-  | "createJunction"
   | "createEdge"
-  | "delete"
-  | "connection"
   | "tls";
+
+export type DrawSubMode = "road" | "connection";
 
 export type ElementType = "junction" | "edge" | "lane" | "connection";
 
@@ -21,6 +19,7 @@ export interface Selection {
 
 interface UIState {
   editMode: EditMode;
+  drawSubMode: DrawSubMode; // Sub-mode for draw: "road" or "connection"
   selection: Selection | null;
   hoverElement: Selection | null;
   cursorPosition: [number, number] | null;
@@ -37,6 +36,7 @@ interface UIState {
 
   // Actions
   setEditMode: (mode: EditMode) => void;
+  setDrawSubMode: (subMode: DrawSubMode) => void;
   setSelection: (sel: Selection | null) => void;
   setHoverElement: (el: Selection | null) => void;
   setCursorPosition: (pos: [number, number] | null) => void;
@@ -48,6 +48,7 @@ interface UIState {
 
 export const useUIStore = create<UIState>((set, get) => ({
   editMode: "inspect",
+  drawSubMode: "road",
   selection: null,
   hoverElement: null,
   cursorPosition: null,
@@ -56,14 +57,32 @@ export const useUIStore = create<UIState>((set, get) => ({
   connectionFromLane: null,
   selectedTLSPhase: new Map<string, number>(),
 
-  setEditMode: (mode) =>
+  setEditMode: (mode) => {
+    const currentMode = get().editMode;
+    // If switching modes and there are dirty changes, trigger compute
+    if (currentMode !== mode) {
+      const networkStore = useNetworkStore.getState();
+      const { dirtyNodes, dirtyEdges, dirtyTLS, resetConnectionEdges, addedConnections, removedConnections, isComputing } = networkStore;
+      const hasConnectionChanges = resetConnectionEdges.size > 0 || addedConnections.length > 0 || removedConnections.length > 0;
+      const hasDirty = dirtyNodes.size > 0 || dirtyEdges.size > 0 || hasConnectionChanges || dirtyTLS.size > 0;
+      
+      // Only auto-compute if there are changes and not already computing
+      if (hasDirty && !isComputing && networkStore.network) {
+        // Trigger compute asynchronously (don't await to avoid blocking mode switch)
+        void networkStore.doComputeNetwork();
+      }
+    }
+    
     set({
       editMode: mode,
       selection: null,
       createEdgeFromJunction: null,
       connectionFromEdge: null,
       connectionFromLane: null,
-    }),
+    });
+  },
+
+  setDrawSubMode: (subMode) => set({ drawSubMode: subMode }),
 
   setSelection: (sel) => set({ selection: sel }),
   setHoverElement: (el) => set({ hoverElement: el }),

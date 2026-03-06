@@ -36,6 +36,7 @@ export default function NetworkMap() {
   const store = useNetworkStore;
 
   const editMode = useUIStore((s) => s.editMode);
+  const drawSubMode = useUIStore((s) => s.drawSubMode);
   const selection = useUIStore((s) => s.selection);
   const hoverElement = useUIStore((s) => s.hoverElement);
   const createEdgeFromJunction = useUIStore((s) => s.createEdgeFromJunction);
@@ -61,16 +62,18 @@ export default function NetworkMap() {
   const lastClickTimeRef = useRef<number>(0);
   const lastClickCoordRef = useRef<[number, number] | null>(null);
   const lastClickJunctionIdRef = useRef<string | undefined>(undefined);
+  const hasInitializedViewRef = useRef<boolean>(false);
 
-  // Center map on network when loaded
+  // Center map on network only on initial load
   useEffect(() => {
-    if (renderable) {
+    if (renderable && !hasInitializedViewRef.current) {
       setViewState((prev: MapViewState) => ({
         ...prev,
         longitude: renderable.center[0],
         latitude: renderable.center[1],
         zoom: renderable.zoom,
       }));
+      hasInitializedViewRef.current = true;
     }
   }, [renderable?.center[0], renderable?.center[1]]);
 
@@ -120,8 +123,6 @@ export default function NetworkMap() {
             return COLORS.laneHover;
           if (hoverElement?.type === "edge" && hoverElement.id === d.edgeId)
             return COLORS.laneHover;
-          if (editMode === "delete" && hoverElement?.id === d.id)
-            return COLORS.deleteHighlight;
           return COLORS.lane;
         },
         widthUnits: "meters" as const,
@@ -150,8 +151,6 @@ export default function NetworkMap() {
           if (hoverElement?.type === "junction" && hoverElement.id === d.id)
             return COLORS.junctionHover;
           if (d.type === "traffic_light") return COLORS.trafficLight;
-          if (editMode === "delete" && hoverElement?.type === "junction" && hoverElement.id === d.id)
-            return COLORS.deleteHighlight;
           return COLORS.junction;
         },
         getLineColor: [30, 30, 30, 200] as any,
@@ -208,15 +207,15 @@ export default function NetworkMap() {
         getColor: (d: RenderableConnection) => getConnectionColor(d) as any,
         widthUnits: "meters" as const,
         widthMinPixels: 1,
-        pickable: editMode === "connection" || editMode === "inspect" || editMode === "tls" || editMode === "delete",
-        visible: editMode === "connection" || editMode === "inspect" || editMode === "tls" || editMode === "delete",
+        pickable: (editMode === "draw" && drawSubMode === "connection") || editMode === "inspect" || editMode === "tls",
+        visible: (editMode === "draw" && drawSubMode === "connection") || editMode === "inspect" || editMode === "tls",
         getDashArray: [4, 2],
         dashJustified: true,
         updateTriggers: {
-          getColor: [selection, selectedTLSPhase],
+          getColor: [selection, selectedTLSPhase, networkVersion],
         },
       }),
-    [renderable?.connections, selection, editMode, getConnectionColor, selectedTLSPhase]
+    [renderable?.connections, selection, editMode, getConnectionColor, selectedTLSPhase, networkVersion]
   );
 
   // Geometry points for selected edge (in inspect mode)
@@ -355,7 +354,7 @@ export default function NetworkMap() {
         capRounded: true,
         jointRounded: true,
         pickable: false,
-        visible: editMode === "draw",
+        visible: editMode === "draw" && drawSubMode === "road",
       }),
     [drawPreviewPath, editMode]
   );
@@ -481,7 +480,7 @@ export default function NetworkMap() {
       
       if (edgeId) {
         setSelection({ type: "edge", id: edgeId });
-        // Automatically trigger compute network (F5) after drawing finishes
+        // Automatically trigger compute network after drawing finishes
         st.doComputeNetwork();
       }
       setDrawDraft(null);
@@ -496,7 +495,7 @@ export default function NetworkMap() {
       const { coordinate } = info;
       if (!coordinate) return;
 
-      if (editMode === "draw") {
+      if (editMode === "draw" && drawSubMode === "road") {
         const clickCoord: [number, number] = [coordinate[0], coordinate[1]];
         // Check if user clicked on an existing junction
         const clickedJunctionId = info.layer?.id === "junctions" 
@@ -552,7 +551,7 @@ export default function NetworkMap() {
 
       // Auto-create a network if none exists and user is in a creation mode
       if (!network || !projection) {
-        if (editMode === "createJunction" || editMode === "createEdge") {
+        if (editMode === "createEdge") {
           store.getState().createNew(coordinate[0], coordinate[1]);
           // After creating, add junction at clicked location
           const st = store.getState();
@@ -567,8 +566,7 @@ export default function NetworkMap() {
       const sumoPos = projection.lngLatToSumo([coordinate[0], coordinate[1]]);
 
       switch (editMode) {
-        case "inspect":
-        case "select": {
+        case "inspect": {
           if (info.layer?.id === "junctions") {
             setSelection({ type: "junction", id: (info.object as any).id });
           } else if (info.layer?.id === "lanes") {
@@ -590,11 +588,6 @@ export default function NetworkMap() {
           break;
         }
 
-        case "createJunction": {
-          store.getState().doAddJunction(sumoPos[0], sumoPos[1]);
-          break;
-        }
-
         case "createEdge": {
           if (info.layer?.id === "junctions") {
             const juncId = (info.object as any).id;
@@ -610,48 +603,27 @@ export default function NetworkMap() {
           break;
         }
 
-        case "delete": {
-          if (info.layer?.id === "junctions") {
-            store.getState().doRemoveJunction((info.object as any).id);
-          } else if (info.layer?.id === "lanes") {
-            store.getState().doRemoveEdge((info.object as any).edgeId);
-          } else if (info.layer?.id === "connections") {
-            const obj = info.object as RenderableConnection;
-            store.getState().doRemoveConnection(obj.from, obj.to, obj.fromLane, obj.toLane);
-          }
-          setSelection(null);
-          break;
-        }
-
-        case "connection": {
-          if (info.layer?.id === "lanes") {
-            const obj = info.object as any;
-            if (!connectionFromEdge) {
-              setConnectionFrom(obj.edgeId, obj.index);
+        case "draw": {
+          if (drawSubMode === "connection") {
+            // Connection drawing mode
+            if (info.layer?.id === "lanes") {
+              const obj = info.object as any;
+              if (!connectionFromEdge) {
+                setConnectionFrom(obj.edgeId, obj.index);
+              } else {
+                store.getState().doAddConnection(
+                  connectionFromEdge,
+                  obj.edgeId,
+                  connectionFromLane!,
+                  obj.index
+                );
+                setConnectionFrom(null, null);
+              }
             } else {
-              store.getState().doAddConnection(
-                connectionFromEdge,
-                obj.edgeId,
-                connectionFromLane!,
-                obj.index
-              );
               setConnectionFrom(null, null);
             }
-          } else {
-            setConnectionFrom(null, null);
           }
-          break;
-        }
-
-        case "move": {
-          if (info.layer?.id === "junctions") {
-            setSelection({ type: "junction", id: (info.object as any).id });
-          } else if (info.layer?.id === "lanes") {
-            const obj = info.object as any;
-            setSelection({ type: "edge", id: obj.edgeId });
-          } else {
-            setSelection(null);
-          }
+          // Road (edge) drawing mode is handled by the draw mode logic above
           break;
         }
 
@@ -698,6 +670,37 @@ export default function NetworkMap() {
     },
     [editMode, finalizeDraw]
   );
+
+  // Handle ESC key to cancel drawing mode
+  React.useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // Only handle ESC if not in an input field
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      
+      if (e.key === "Escape" && editMode === "draw") {
+        e.preventDefault();
+        // Clear drawing draft
+        setDrawDraft(null);
+        // Clear any pending click timers
+        if (drawClickTimerRef.current) {
+          clearTimeout(drawClickTimerRef.current);
+          drawClickTimerRef.current = null;
+        }
+        // Reset click tracking
+        lastClickTimeRef.current = 0;
+        lastClickCoordRef.current = null;
+        lastClickJunctionIdRef.current = undefined;
+        // Clear connection state if in connection mode
+        if (drawSubMode === "connection") {
+          setConnectionFrom(null, null);
+        }
+        // Switch back to inspect mode
+        setEditMode("inspect");
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [editMode, drawSubMode, setEditMode, setConnectionFrom]);
 
   const [hoveredLayer, setHoveredLayer] = React.useState<string | null>(null);
 
@@ -769,27 +772,26 @@ export default function NetworkMap() {
     ({ isDragging }: { isDragging: boolean }) => {
       if (isDragging) return "grabbing";
       switch (editMode) {
-        case "createJunction":
-          return "crosshair";
         case "draw":
           return "crosshair";
         case "createEdge":
           return createEdgeFromJunction ? "crosshair" : "pointer";
-        case "delete":
-          return "pointer";
         case "inspect":
           // Show grab cursor when hovering over draggable items (junctions, geometry points)
           if (hoverElement?.type === "junction" || hoveredLayer === "geometry-points") {
             return "grab";
           }
           return "default";
-        case "connection":
-          return connectionFromEdge ? "crosshair" : "pointer";
+        case "draw":
+          if (drawSubMode === "connection") {
+            return connectionFromEdge ? "crosshair" : "pointer";
+          }
+          return "crosshair";
         default:
           return "default";
       }
     },
-    [editMode, createEdgeFromJunction, connectionFromEdge, hoverElement, hoveredLayer]
+    [editMode, drawSubMode, createEdgeFromJunction, connectionFromEdge, hoverElement, hoveredLayer]
   );
 
   return (

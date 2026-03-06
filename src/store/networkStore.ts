@@ -119,8 +119,11 @@ interface NetworkState {
   doRemoveConnection: (from: string, to: string, fromLane: number, toLane: number) => void;
   doSetJunctionType: (id: string, type: JunctionType) => void;
   doSetTLSOffset: (junctionId: string, offset: number) => void;
+  doSetTLSType: (junctionId: string, type: "static" | "actuated") => void;
   doSetTLSPhaseDuration: (junctionId: string, phaseIndex: number, duration: number) => void;
   doSetTLSPhaseState: (junctionId: string, phaseIndex: number, state: string) => void;
+  doSetTLSPhaseMinDur: (junctionId: string, phaseIndex: number, minDur: number) => void;
+  doSetTLSPhaseMaxDur: (junctionId: string, phaseIndex: number, maxDur: number) => void;
   doAddTLSPhase: (junctionId: string) => void;
   doRemoveTLSPhase: (junctionId: string, phaseIndex: number) => void;
   doComputeNetwork: () => Promise<void>;
@@ -455,7 +458,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       markDirtyEdge(id);
       rebuildRenderable();
 
-      // Automatically trigger compute network (F5) when numLanes changes
+      // Automatically trigger compute network when numLanes changes
       if (attr === "numLanes" && oldNumLanes !== undefined && oldNumLanes !== value) {
         get().doComputeNetwork();
       }
@@ -572,7 +575,10 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         network.tlLogics = network.tlLogics.filter((t) => t.id !== id);
         network.tlLogics.push(tls);
         markDirtyTLS(id);
-  
+        // Rebuild renderable and increment networkVersion immediately so TLS editor can access the new TLS logic
+        const { networkVersion: currentVersion } = get();
+        rebuildRenderable();
+        set({ networkVersion: currentVersion + 1 });
       } else if (type !== "traffic_light" && oldType === "traffic_light") {
         network.tlLogics = network.tlLogics.filter((t) => t.id !== id);
         for (const conn of network.connections) {
@@ -582,10 +588,10 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
           }
         }
         markDirtyTLS(id);
-  
+        recomputeAndRebuild(network);
+      } else {
+        recomputeAndRebuild(network);
       }
-
-      recomputeAndRebuild(network);
     },
 
     doSetTLSOffset: (junctionId, offset) => {
@@ -647,7 +653,69 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       pushHistory();
       phase.state = normalized;
       markDirtyTLS(junctionId);
+      const { networkVersion: currentVersion } = get();
       rebuildRenderable();
+      set({ networkVersion: currentVersion + 1 });
+    },
+
+    doSetTLSType: (junctionId, type) => {
+      const { network } = get();
+      if (!network) return;
+      const junction = network.junctions.get(junctionId);
+      if (!junction || junction.type !== "traffic_light") return;
+      pushHistory();
+      const tls = network.tlLogics.find((t) => t.id === junctionId);
+      if (!tls) return;
+      if (tls.type === type) return;
+      tls.type = type;
+      markDirtyTLS(junctionId);
+      const { networkVersion: currentVersion } = get();
+      rebuildRenderable();
+      set({ networkVersion: currentVersion + 1 });
+    },
+
+    doSetTLSPhaseMinDur: (junctionId, phaseIndex, minDur) => {
+      const { network } = get();
+      if (!network) return;
+      const junction = network.junctions.get(junctionId);
+      if (!junction || junction.type !== "traffic_light") return;
+      pushHistory();
+      const tls = network.tlLogics.find((t) => t.id === junctionId);
+      if (!tls || phaseIndex < 0 || phaseIndex >= tls.phases.length) return;
+      const phase = tls.phases[phaseIndex];
+      const next = Math.max(1, Math.round(Number(minDur) || 1));
+      if (phase.minDur === next) return;
+      phase.minDur = next;
+      // Ensure minDur doesn't exceed duration
+      if (phase.minDur > phase.duration) {
+        phase.minDur = phase.duration;
+      }
+      markDirtyTLS(junctionId);
+      const { networkVersion: currentVersion } = get();
+      rebuildRenderable();
+      set({ networkVersion: currentVersion + 1 });
+    },
+
+    doSetTLSPhaseMaxDur: (junctionId, phaseIndex, maxDur) => {
+      const { network } = get();
+      if (!network) return;
+      const junction = network.junctions.get(junctionId);
+      if (!junction || junction.type !== "traffic_light") return;
+      pushHistory();
+      const tls = network.tlLogics.find((t) => t.id === junctionId);
+      if (!tls || phaseIndex < 0 || phaseIndex >= tls.phases.length) return;
+      const phase = tls.phases[phaseIndex];
+      const next = Math.max(1, Math.round(Number(maxDur) || phase.duration));
+      if (phase.maxDur === next) return;
+      phase.maxDur = next;
+      // Ensure maxDur is at least duration
+      if (phase.maxDur < phase.duration) {
+        phase.maxDur = phase.duration;
+      }
+      markDirtyTLS(junctionId);
+      const { networkVersion: currentVersion } = get();
+      rebuildRenderable();
+      set({ networkVersion: currentVersion + 1 });
     },
 
     doAddTLSPhase: (junctionId) => {

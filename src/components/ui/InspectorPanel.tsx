@@ -20,6 +20,7 @@ const JUNCTION_TYPES: JunctionType[] = [
 export default function InspectorPanel() {
   const selection = useUIStore((s) => s.selection);
   const editMode = useUIStore((s) => s.editMode);
+  const drawSubMode = useUIStore((s) => s.drawSubMode);
   const setSelection = useUIStore((s) => s.setSelection);
   const network = useNetworkStore((s) => s.network);
   const doRemoveJunction = useNetworkStore((s) => s.doRemoveJunction);
@@ -28,7 +29,7 @@ export default function InspectorPanel() {
 
   if (!selection || !network) return null;
 
-  if (editMode === "connection" && selection.type === "junction") {
+  if (editMode === "draw" && drawSubMode === "connection" && selection.type === "junction") {
     return <ConnectionEditor junctionId={selection.id} />;
   }
 

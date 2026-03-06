@@ -3,6 +3,36 @@
 import React, { useRef, useState, useEffect } from "react";
 import { useNetworkStore } from "@/store/networkStore";
 
+// SVG Icons
+const NewIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 5v14" />
+    <path d="M5 12h14" />
+  </svg>
+);
+
+const OpenIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <polyline points="17 8 12 3 7 8" />
+    <line x1="12" y1="3" x2="12" y2="15" />
+  </svg>
+);
+
+const ExportIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <polyline points="7 10 12 15 17 10" />
+    <line x1="12" y1="15" x2="12" y2="3" />
+  </svg>
+);
+
+const ComputeIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <polygon points="5 3 19 12 5 21 5 3" />
+  </svg>
+);
+
 export default function FileUpload() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const loadFromXML = useNetworkStore((s) => s.loadFromXML);
@@ -75,7 +105,7 @@ export default function FileUpload() {
   };
 
   return (
-    <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 flex gap-2">
+    <div className="absolute top-2 left-2 z-10 flex gap-2">
       <input
         ref={fileInputRef}
         type="file"
@@ -85,32 +115,35 @@ export default function FileUpload() {
       />
       <button
         onClick={handleNew}
-        className="px-3 py-1.5 bg-gray-700/90 text-gray-200 rounded-lg text-sm hover:bg-gray-600 backdrop-blur-sm shadow"
+        className="w-10 h-10 bg-gray-700/90 text-gray-200 rounded-lg hover:bg-gray-600 backdrop-blur-sm shadow flex items-center justify-center"
+        title="Create a new network"
       >
-        New
+        <NewIcon />
       </button>
       <button
         onClick={handleFileOpen}
-        className="px-3 py-1.5 bg-gray-700/90 text-gray-200 rounded-lg text-sm hover:bg-gray-600 backdrop-blur-sm shadow"
+        className="w-10 h-10 bg-gray-700/90 text-gray-200 rounded-lg hover:bg-gray-600 backdrop-blur-sm shadow flex items-center justify-center"
+        title="Open a network XML file"
       >
-        Open net.xml
+        <OpenIcon />
       </button>
       {network && (
         <button
           onClick={handleExport}
-          className="px-3 py-1.5 bg-blue-600/90 text-white rounded-lg text-sm hover:bg-blue-500 backdrop-blur-sm shadow"
+          className="w-10 h-10 bg-blue-600/90 text-white rounded-lg hover:bg-blue-500 backdrop-blur-sm shadow flex items-center justify-center"
+          title="Export network to XML file"
         >
-          Export net.xml
+          <ExportIcon />
         </button>
       )}
       {network && (
         <button
           onClick={() => void doComputeNetwork()}
           disabled={isComputing}
-          className="px-3 py-1.5 bg-emerald-600/90 text-white rounded-lg text-sm hover:bg-emerald-500 disabled:bg-emerald-800/80 disabled:text-emerald-200 disabled:cursor-not-allowed backdrop-blur-sm shadow"
-          title="Compute network using netconvert (F5)"
+          className="w-10 h-10 bg-emerald-600/90 text-white rounded-lg hover:bg-emerald-500 disabled:bg-emerald-800/80 disabled:text-emerald-200 disabled:cursor-not-allowed backdrop-blur-sm shadow flex items-center justify-center"
+          title={isComputing ? "Computing network..." : "Compute network using netconvert"}
         >
-          {isComputing ? "Computing..." : "Compute (F5)"}
+          <ComputeIcon />
         </button>
       )}
       {computeError && (
