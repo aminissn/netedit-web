@@ -33,6 +33,9 @@ import {
   interpolatePolyline,
   cross,
   dot,
+  bezierCurve,
+  endDirection,
+  startDirection,
 } from "./geometry";
 import {
   computeNodeShape,
@@ -110,8 +113,6 @@ export function moveJunction(
     }
   });
 
-  // Recompute junction shape
-  junction.shape = computeNodeShape(junction, network.edges);
 }
 
 export function removeJunction(network: SUMONetwork, junctionId: string): void {
@@ -182,10 +183,6 @@ export function addEdge(
   // Recompute lane shapes with proper endpoint snapping to junction centers
   recomputeLaneShapes(edge, network);
 
-  // Recompute affected junctions with the SUMO-style node-shape algorithm.
-  fromJunction.shape = computeNodeShape(fromJunction, network.edges);
-  toJunction.shape = computeNodeShape(toJunction, network.edges);
-
   // Guess connections
   guessConnectionsForEdge(network, edge);
 
@@ -235,11 +232,6 @@ export function setEdgeAttribute(
         (c) => c.from !== edgeId && c.to !== edgeId
       );
       guessConnectionsForEdge(network, edge);
-      // Recompute junction shapes
-      const fromJ = network.junctions.get(edge.from);
-      const toJ = network.junctions.get(edge.to);
-      if (fromJ) fromJ.shape = computeNodeShape(fromJ, network.edges);
-      if (toJ) toJ.shape = computeNodeShape(toJ, network.edges);
       break;
     }
     case "speed":
@@ -261,12 +253,48 @@ export function setEdgeAttribute(
     case "spreadType":
       edge.spreadType = "right";
       recomputeLaneShapes(edge, network);
-      {
-        const fromJ = network.junctions.get(edge.from);
-        const toJ = network.junctions.get(edge.to);
-        if (fromJ) fromJ.shape = computeNodeShape(fromJ, network.edges);
-        if (toJ) toJ.shape = computeNodeShape(toJ, network.edges);
+      break;
+  }
+}
+
+export function setLaneAttribute(
+  network: SUMONetwork,
+  laneId: string,
+  attr: string,
+  value: any
+): void {
+  let targetLane: SUMOLane | undefined;
+  for (const edge of Array.from(network.edges.values())) {
+    const lane = edge.lanes.find((l) => l.id === laneId);
+    if (lane) {
+      targetLane = lane;
+      break;
+    }
+  }
+  if (!targetLane) return;
+
+  switch (attr) {
+    case "speed": {
+      const speed = Number(value);
+      if (Number.isFinite(speed) && speed > 0) {
+        targetLane.speed = speed;
       }
+      break;
+    }
+    case "width": {
+      const width = Number(value);
+      if (Number.isFinite(width) && width > 0) {
+        targetLane.width = width;
+      }
+      break;
+    }
+    case "allow":
+      targetLane.allow = String(value);
+      break;
+    case "disallow":
+      targetLane.disallow = String(value);
+      break;
+    default:
       break;
   }
 }
@@ -577,12 +605,22 @@ export function buildRenderableNetwork(network: SUMONetwork): RenderableNetwork 
     const fromEnd = fromLaneShape[fromLaneShape.length - 1];
     const toStart = toLaneShape[0];
 
+    // Get directions at the end of fromLane and start of toLane
+    const fromDir = endDirection(fromLaneShape);
+    const toDir = startDirection(toLaneShape);
+    
+    // Generate smooth bezier curve with 8 points
+    const bezierPoints = bezierCurve(fromEnd, toStart, fromDir, toDir, 8);
+    
+    // Convert to LngLat coordinates
+    const path = proj.sumoShapeToLngLat(bezierPoints);
+
     connections.push({
       from: conn.from,
       to: conn.to,
       fromLane: conn.fromLane,
       toLane: conn.toLane,
-      path: proj.sumoShapeToLngLat([fromEnd, toStart]),
+      path,
       tl: conn.tl,
       linkIndex: conn.linkIndex,
     });
