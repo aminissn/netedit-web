@@ -152,6 +152,7 @@ function EdgeInspector({ id }: { id: string }) {
 function LaneInspector({ laneId, edgeId }: { laneId: string; edgeId?: string }) {
   const network = useNetworkStore((s) => s.network);
   const doSetLaneAttribute = useNetworkStore((s) => s.doSetLaneAttribute);
+  const doSetEdgeAttribute = useNetworkStore((s) => s.doSetEdgeAttribute);
 
   let edge = edgeId ? network?.edges.get(edgeId) : undefined;
   if (!edge && network) {
@@ -169,6 +170,12 @@ function LaneInspector({ laneId, edgeId }: { laneId: string; edgeId?: string }) 
     <>
       <Field label="ID" value={lane.id} />
       <Field label="Edge" value={edge.id} />
+      <EditableField
+        label="Lanes"
+        value={edge.numLanes.toString()}
+        onChange={(v) => doSetEdgeAttribute(edge.id, "numLanes", parseInt(v))}
+        type="number"
+      />
       <Field label="Index" value={lane.index.toString()} />
       <EditableField
         label="Speed"
