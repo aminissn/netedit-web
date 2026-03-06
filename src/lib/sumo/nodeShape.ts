@@ -452,8 +452,10 @@ export function computeSetback(
   allEdges: Map<string, SUMOEdge>
 ): number {
   const geometricSetback = computeSetbackFromJunctionShape(junction, edge);
-  if (geometricSetback !== null) {
-    return geometricSetback;
+  if (geometricSetback !== null && geometricSetback > 0) {
+    // Use geometric setback, but reduce it slightly to avoid over-trimming
+    // This accounts for potential precision issues in intersection calculation
+    return Math.max(0, geometricSetback * 0.95);
   }
 
   let maxHalfWidth = 0;
@@ -468,8 +470,9 @@ export function computeSetback(
 
   if (edgeCount <= 1) return MIN_SETBACK;
 
-  // Setback = roughly the half-width of the widest road + a bit
-  return Math.max(MIN_SETBACK, maxHalfWidth + 1);
+  // Setback = roughly the half-width of the widest road
+  // Reduced from maxHalfWidth + 1 to just maxHalfWidth to avoid over-trimming
+  return Math.max(MIN_SETBACK, maxHalfWidth);
 }
 
 function computeSetbackFromJunctionShape(junction: SUMOJunction, edge: SUMOEdge): number | null {
@@ -503,7 +506,12 @@ function computeSetbackFromJunctionShape(junction: SUMOJunction, edge: SUMOEdge)
     traveled += segmentLength;
   }
 
-  return Number.isFinite(bestDistance) ? Math.max(0, bestDistance) : null;
+  // Return the intersection distance, but ensure it's not zero
+  // Add a small tolerance to avoid over-trimming
+  if (Number.isFinite(bestDistance) && bestDistance > epsilon) {
+    return Math.max(0, bestDistance);
+  }
+  return null;
 }
 
 function segmentIntersectionParam(a: XY, b: XY, c: XY, d: XY): number | null {

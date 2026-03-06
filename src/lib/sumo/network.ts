@@ -546,9 +546,44 @@ function getTrimmedEdgeShape(
   const fromJ = junctions.get(edge.from);
   const toJ = junctions.get(edge.to);
 
-  const fromSetback = fromJ ? computeSetback(fromJ, edge, allEdges) : 0;
-  const toSetback = toJ ? computeSetback(toJ, edge, allEdges) : 0;
+  // First, ensure edge extends to junction centers
+  // This is important because setback calculation expects edges to start/end at junction centers
+  if (fromJ && shape.length > 0) {
+    const distFromJ = dist(shape[0], [fromJ.x, fromJ.y]);
+    if (distFromJ > 0.1) {
+      // Edge doesn't start at junction center - extend it
+      shape = [[fromJ.x, fromJ.y], ...shape];
+    } else {
+      // Snap to junction center if close
+      shape[0] = [fromJ.x, fromJ.y];
+    }
+  }
 
+  if (toJ && shape.length > 0) {
+    const lastIdx = shape.length - 1;
+    const distToJ = dist(shape[lastIdx], [toJ.x, toJ.y]);
+    if (distToJ > 0.1) {
+      // Edge doesn't end at junction center - extend it
+      shape = [...shape, [toJ.x, toJ.y]];
+    } else {
+      // Snap to junction center if close
+      shape[lastIdx] = [toJ.x, toJ.y];
+    }
+  }
+
+  // Create a temporary edge with the extended shape for setback calculation
+  // This ensures the setback calculation uses an edge that starts/ends at junction centers
+  const edgeForSetback: SUMOEdge = {
+    ...edge,
+    shape: shape,
+  };
+
+  // Compute setbacks using the extended edge shape
+  // This ensures accurate calculation of where the edge intersects junction boundaries
+  const fromSetback = fromJ ? computeSetback(fromJ, edgeForSetback, allEdges) : 0;
+  const toSetback = toJ ? computeSetback(toJ, edgeForSetback, allEdges) : 0;
+
+  // Apply setbacks to trim the edge at junction boundaries
   if (fromSetback > 0) {
     shape = trimPolylineStart(shape, fromSetback);
   }
@@ -584,6 +619,29 @@ function getTrimmedLaneShape(
   const fromJ = junctions.get(edge.from);
   const toJ = junctions.get(edge.to);
 
+  // Ensure lane shape extends to junction centers before trimming
+  // Lanes from netconvert should already extend to centers, but we ensure it
+  if (fromJ && shape.length > 0) {
+    const distFromJ = dist(shape[0], [fromJ.x, fromJ.y]);
+    if (distFromJ > 0.1) {
+      shape = [[fromJ.x, fromJ.y], ...shape];
+    } else {
+      shape[0] = [fromJ.x, fromJ.y];
+    }
+  }
+
+  if (toJ && shape.length > 0) {
+    const lastIdx = shape.length - 1;
+    const distToJ = dist(shape[lastIdx], [toJ.x, toJ.y]);
+    if (distToJ > 0.1) {
+      shape = [...shape, [toJ.x, toJ.y]];
+    } else {
+      shape[lastIdx] = [toJ.x, toJ.y];
+    }
+  }
+
+  // Use the edge's setback calculation (same for all lanes of an edge)
+  // The setback is based on the edge's relationship to the junction, not individual lanes
   const fromSetback = fromJ ? computeSetback(fromJ, edge, allEdges) : 0;
   const toSetback = toJ ? computeSetback(toJ, edge, allEdges) : 0;
 
