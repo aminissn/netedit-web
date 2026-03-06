@@ -411,9 +411,14 @@ function getLaneOffsetFromCenter(
   laneWidth: number
 ): number {
   if (spreadType === "right") {
-    // In SUMO, lane 0 is rightmost in travel direction.
-    return (laneIndex + 0.5) * laneWidth;
+    // In SUMO "right" spreadType, lane 0 is rightmost (closest to centerline in travel direction).
+    // offsetPolyline with positive value offsets to the right (which is left in travel direction).
+    // So lane 0 (rightmost) should have the LARGEST positive offset to be furthest right.
+    // Higher index lanes are to the left, so they need smaller offsets.
+    // Reverse the formula: (numLanes - 1 - laneIndex + 0.5) * laneWidth
+    return (numLanes - 1 - laneIndex + 0.5) * laneWidth;
   }
+  // For "center" or "roadCenter", lanes are symmetric around centerline
   return (laneIndex - (numLanes - 1) / 2) * laneWidth;
 }
 
@@ -713,12 +718,32 @@ export function buildRenderableNetwork(network: SUMONetwork): RenderableNetwork 
     const toEdge = network.edges.get(conn.to);
     if (!fromEdge || !toEdge) continue;
 
-    const fromLane = fromEdge.lanes[conn.fromLane];
-    const toLane = toEdge.lanes[conn.toLane];
-    if (!fromLane || !toLane) continue;
+    const fromLaneIdx = conn.fromLane;
+    const toLaneIdx = conn.toLane;
+    if (fromLaneIdx >= fromEdge.numLanes || toLaneIdx >= toEdge.numLanes) continue;
 
-    const fromLaneShape = trimmedLaneShapes.get(fromLane.id) ?? fromLane.shape;
-    const toLaneShape = trimmedLaneShapes.get(toLane.id) ?? toLane.shape;
+    // CRITICAL: For connections, always compute from trimmed edge shapes + lane offset.
+    // This ensures connections start/end exactly where edges are visually trimmed
+    // (at junction boundaries), regardless of what lane.shape contains.
+    // 
+    // Using getTrimmedLaneShape on a lane shape that extends to junction centers
+    // creates a diagonal segment from junction center (on edge centerline) to lane start,
+    // which causes connections to start inside the junction.
+    const fromTrimmedEdge = trimmedEdgeShapes.get(fromEdge.id)
+      ?? getTrimmedEdgeShape(fromEdge, network.junctions, network.edges);
+    const toTrimmedEdge = trimmedEdgeShapes.get(toEdge.id)
+      ?? getTrimmedEdgeShape(toEdge, network.junctions, network.edges);
+
+    if (fromTrimmedEdge.length < 2 || toTrimmedEdge.length < 2) continue;
+
+    // Compute lane shapes directly from trimmed edge shapes
+    const fromLaneShape = computeLaneShape(fromTrimmedEdge, fromLaneIdx, fromEdge.numLanes, fromEdge.spreadType);
+    const toLaneShape = computeLaneShape(toTrimmedEdge, toLaneIdx, toEdge.numLanes, toEdge.spreadType);
+
+    if (fromLaneShape.length < 2 || toLaneShape.length < 2) continue;
+
+    // Use the last point of trimmed fromLane and first point of trimmed toLane
+    // These are exactly at the junction boundaries (setback points)
     const fromEnd = fromLaneShape[fromLaneShape.length - 1];
     const toStart = toLaneShape[0];
 
