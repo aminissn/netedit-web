@@ -147,6 +147,9 @@ export async function POST(req: Request) {
     const args = [
       "--sumo-net-file", inputPath,
       "--output-file", outputPath,
+      "--no-turnarounds.tls",
+      "--no-internal-links",
+      "--offset.disable-normalization",
     ];
 
     if (hasPatchFiles) {
