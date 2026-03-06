@@ -124,13 +124,97 @@ export function exportNetXML(network: SUMONetwork): string {
 }
 
 /**
+ * Merge two patch XML files by combining their content.
+ * Removes duplicates (keeps the latest version of each element).
+ * For connections (which don't have IDs), uses a composite key.
+ */
+function mergePatchXML(existingXML: string | null, newXML: string | null, rootTag: string): string | null {
+  if (!newXML) return existingXML;
+  if (!existingXML) return newXML;
+
+  // Parse both XMLs and extract elements
+  const existingParser = new DOMParser();
+  const newParser = new DOMParser();
+  const existingDoc = existingParser.parseFromString(existingXML, "text/xml");
+  const newDoc = newParser.parseFromString(newXML, "text/xml");
+
+  const existingRoot = existingDoc.querySelector(rootTag);
+  const newRoot = newDoc.querySelector(rootTag);
+  if (!existingRoot || !newRoot) return newXML;
+
+  // Track elements we've seen (from new XML, which takes precedence)
+  const seenKeys = new Set<string>();
+
+  // Helper to generate a key for an element
+  const getElementKey = (el: Element): string => {
+    const id = el.getAttribute("id");
+    if (id) return id;
+    // For connections, use composite key
+    if (el.tagName === "connection" || el.tagName === "delete") {
+      const from = el.getAttribute("from") || "";
+      const to = el.getAttribute("to") || "";
+      const fromLane = el.getAttribute("fromLane") || "";
+      const toLane = el.getAttribute("toLane") || "";
+      return `${el.tagName}:${from}:${to}:${fromLane}:${toLane}`;
+    }
+    // Fallback: use all attributes as key
+    return Array.from(el.attributes).map(a => `${a.name}=${a.value}`).join("|");
+  };
+
+  // First, add all elements from new XML (these take precedence)
+  const mergedElements: Element[] = [];
+  newRoot.querySelectorAll("*").forEach((el) => {
+    const key = getElementKey(el);
+    seenKeys.add(key);
+    mergedElements.push(el);
+  });
+
+  // Then, add elements from existing XML that aren't in new XML
+  existingRoot.querySelectorAll("*").forEach((el) => {
+    const key = getElementKey(el);
+    if (!seenKeys.has(key)) {
+      mergedElements.push(el);
+    }
+  });
+
+  // Build merged XML
+  const lines: string[] = [];
+  lines.push('<?xml version="1.0" encoding="UTF-8"?>');
+  lines.push(`<${rootTag}>`);
+  mergedElements.forEach((el) => {
+    const attrs: string[] = [];
+    Array.from(el.attributes).forEach((attr) => {
+      attrs.push(`${attr.name}="${escapeAttr(attr.value)}"`);
+    });
+    const tagName = el.tagName;
+    if (el.childElementCount === 0) {
+      lines.push(`    <${tagName} ${attrs.join(" ")}/>`);
+    } else {
+      lines.push(`    <${tagName} ${attrs.join(" ")}>`);
+      el.querySelectorAll("*").forEach((child) => {
+        const childAttrs: string[] = [];
+        Array.from(child.attributes).forEach((attr) => {
+          childAttrs.push(`${attr.name}="${escapeAttr(attr.value)}"`);
+        });
+        lines.push(`        <${child.tagName} ${childAttrs.join(" ")}/>`);
+      });
+      lines.push(`    </${tagName}>`);
+    }
+  });
+  lines.push(`</${rootTag}>`);
+  return lines.join("\n");
+}
+
+/**
  * Export a .nod.xml patch containing only the specified dirty junctions.
+ * Can merge with existing patch XML.
  */
 export function exportPatchNodXML(
   network: SUMONetwork,
-  dirtyNodeIds: Set<string>
+  dirtyNodeIds: Set<string>,
+  existingPatchXML?: string | null
 ): string | null {
-  if (dirtyNodeIds.size === 0) return null;
+  if (dirtyNodeIds.size === 0) return existingPatchXML || null;
   const lines: string[] = [];
   lines.push('<?xml version="1.0" encoding="UTF-8"?>');
   lines.push('<nodes>');
@@ -151,17 +235,20 @@ export function exportPatchNodXML(
     lines.push(`    <node ${attrs.join(" ")}/>`);
   }
   lines.push('</nodes>');
-  return lines.join("\n");
+  const newXML = lines.join("\n");
+  return mergePatchXML(existingPatchXML, newXML, "nodes");
 }
 
 /**
  * Export a .edg.xml patch containing only the specified dirty edges.
+ * Can merge with existing patch XML.
  */
 export function exportPatchEdgXML(
   network: SUMONetwork,
-  dirtyEdgeIds: Set<string>
+  dirtyEdgeIds: Set<string>,
+  existingPatchXML?: string | null
 ): string | null {
-  if (dirtyEdgeIds.size === 0) return null;
+  if (dirtyEdgeIds.size === 0) return existingPatchXML || null;
   const lines: string[] = [];
   lines.push('<?xml version="1.0" encoding="UTF-8"?>');
   lines.push('<edges>');
@@ -187,7 +274,8 @@ export function exportPatchEdgXML(
     lines.push(`    <edge ${attrs.join(" ")}/>`);
   }
   lines.push('</edges>');
-  return lines.join("\n");
+  const newXML = lines.join("\n");
+  return mergePatchXML(existingPatchXML, newXML, "edges");
 }
 
 interface ConnectionEntry {
@@ -202,13 +290,15 @@ interface ConnectionEntry {
  * - All connections from and to edges whose numLanes changed (with both from and to edge IDs)
  * - Explicitly added connections
  * - Explicitly removed connections (with remove="true")
+ * Can merge with existing patch XML.
  */
 export function exportPatchConXML(
   resetEdges: Set<string>,
   resetConnectionSnapshots: Map<string, { from: string; to: string }[]>,
   addedConnections: ConnectionEntry[],
   removedConnections: ConnectionEntry[],
-  network: SUMONetwork
+  network: SUMONetwork,
+  existingPatchXML?: string | null
 ): string {
   const lines: string[] = [];
   lines.push('<?xml version="1.0" encoding="UTF-8"?>');
@@ -254,17 +344,20 @@ export function exportPatchConXML(
   }
 
   lines.push('</connections>');
-  return lines.join("\n");
+  const newXML = lines.join("\n");
+  return mergePatchXML(existingPatchXML, newXML, "connections") || newXML;
 }
 
 /**
  * Export a .tll.xml patch containing only the specified dirty TLS programs.
+ * Can merge with existing patch XML.
  */
 export function exportPatchTllXML(
   network: SUMONetwork,
-  dirtyTLSIds: Set<string>
+  dirtyTLSIds: Set<string>,
+  existingPatchXML?: string | null
 ): string | null {
-  if (dirtyTLSIds.size === 0) return null;
+  if (dirtyTLSIds.size === 0) return existingPatchXML || null;
   const lines: string[] = [];
   lines.push('<?xml version="1.0" encoding="UTF-8"?>');
   lines.push('<tlLogics>');
@@ -287,5 +380,6 @@ export function exportPatchTllXML(
     lines.push("    </tlLogic>");
   }
   lines.push('</tlLogics>');
-  return lines.join("\n");
+  const newXML = lines.join("\n");
+  return mergePatchXML(existingPatchXML, newXML, "tlLogics");
 }

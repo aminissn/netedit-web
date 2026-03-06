@@ -72,6 +72,13 @@ interface NetworkState {
 
   /** The last-computed (or initially-loaded) net.xml, used as base for patch-mode netconvert. */
   baseNetXML: string | null;
+  /** Accumulated patch files that persist across multiple compute operations */
+  accumulatedPatches: {
+    nodXML: string | null;
+    edgXML: string | null;
+    conXML: string | null;
+    tllXML: string | null;
+  };
   /** Element IDs that changed since the last compute / load. */
   dirtyNodes: Set<string>;
   dirtyEdges: Set<string>;
@@ -261,6 +268,12 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
     isComputing: false,
     computeError: null,
     baseNetXML: null,
+    accumulatedPatches: {
+      nodXML: null,
+      edgXML: null,
+      conXML: null,
+      tllXML: null,
+    },
     dirtyNodes: new Set<string>(),
     dirtyEdges: new Set<string>(),
     dirtyTLS: new Set<string>(),
@@ -279,6 +292,12 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         historyIndex: 0,
         computeError: null,
         baseNetXML: xml,
+        accumulatedPatches: {
+          nodXML: null,
+          edgXML: null,
+          conXML: null,
+          tllXML: null,
+        },
       });
       clearDirty();
     },
@@ -294,6 +313,12 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         historyIndex: 0,
         computeError: null,
         baseNetXML: xml,
+        accumulatedPatches: {
+          nodXML: null,
+          edgXML: null,
+          conXML: null,
+          tllXML: null,
+        },
       });
       clearDirty();
     },
@@ -622,7 +647,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
     },
 
     doComputeNetwork: async () => {
-      const { network, isComputing, baseNetXML, dirtyNodes, dirtyEdges, dirtyTLS, resetConnectionEdges, resetConnectionSnapshots, addedConnections, removedConnections } = get();
+      const { network, isComputing, baseNetXML, accumulatedPatches, dirtyNodes, dirtyEdges, dirtyTLS, resetConnectionEdges, resetConnectionSnapshots, addedConnections, removedConnections } = get();
       if (!network || isComputing) return;
       const snapshot = deepCloneNetwork(network);
       set({ isComputing: true, computeError: null });
@@ -637,21 +662,33 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
           conXML?: string;
           tllXML?: string;
         };
+        let newPatches = { ...accumulatedPatches };
 
         if (baseNetXML) {
           // Always use the original uploaded file as base when it exists
           if (hasDirty) {
-            // Patch mode: send original base + only changed elements
+            // Patch mode: send original base + only changed elements (merged with existing patches)
             payload = { baseNetXML };
-            const nodPatch = exportPatchNodXML(network, dirtyNodes);
-            const edgPatch = exportPatchEdgXML(network, dirtyEdges);
-            const tllPatch = exportPatchTllXML(network, dirtyTLS);
-            if (nodPatch) payload.nodXML = nodPatch;
-            if (edgPatch) payload.edgXML = edgPatch;
-            if (hasConnectionChanges) {
-              payload.conXML = exportPatchConXML(resetConnectionEdges, resetConnectionSnapshots, addedConnections, removedConnections, network);
+            const nodPatch = exportPatchNodXML(network, dirtyNodes, accumulatedPatches.nodXML);
+            const edgPatch = exportPatchEdgXML(network, dirtyEdges, accumulatedPatches.edgXML);
+            const tllPatch = exportPatchTllXML(network, dirtyTLS, accumulatedPatches.tllXML);
+            if (nodPatch) {
+              payload.nodXML = nodPatch;
+              newPatches.nodXML = nodPatch;
             }
-            if (tllPatch) payload.tllXML = tllPatch;
+            if (edgPatch) {
+              payload.edgXML = edgPatch;
+              newPatches.edgXML = edgPatch;
+            }
+            if (hasConnectionChanges) {
+              const conPatch = exportPatchConXML(resetConnectionEdges, resetConnectionSnapshots, addedConnections, removedConnections, network, accumulatedPatches.conXML);
+              payload.conXML = conPatch;
+              newPatches.conXML = conPatch;
+            }
+            if (tllPatch) {
+              payload.tllXML = tllPatch;
+              newPatches.tllXML = tllPatch;
+            }
           } else {
             // No changes: just use the original base file (no patches)
             payload = { baseNetXML };
@@ -659,6 +696,13 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         } else {
           // Full mode: no original base (new network) — send full network
           payload = { baseNetXML: exportNetXML(snapshot) };
+          // Reset patches for new network
+          newPatches = {
+            nodXML: null,
+            edgXML: null,
+            conXML: null,
+            tllXML: null,
+          };
         }
 
         const computedXml = await computeViaNetconvert(payload);
@@ -666,7 +710,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         pushSnapshot(snapshot);
         setCurrentNetwork(computedNetwork);
         // Keep baseNetXML unchanged - it should always be the original uploaded file
-        set({ isComputing: false, computeError: null });
+        // Update accumulated patches for next compute
+        set({ isComputing: false, computeError: null, accumulatedPatches: newPatches });
         clearDirty();
       } catch (error: unknown) {
         const message =
