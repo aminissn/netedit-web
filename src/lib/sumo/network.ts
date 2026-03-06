@@ -34,7 +34,12 @@ import {
   cross,
   dot,
 } from "./geometry";
-import { computeNodeShape, computeSetback, trimPolylineStart, trimPolylineEnd } from "./nodeShape";
+import {
+  computeNodeShape,
+  computeSetback,
+  trimPolylineStart,
+  trimPolylineEnd,
+} from "./nodeShape";
 import { generateTLSProgram } from "./tlsGenerate";
 
 let idCounter = 0;
@@ -177,7 +182,7 @@ export function addEdge(
   // Recompute lane shapes with proper endpoint snapping to junction centers
   recomputeLaneShapes(edge, network);
 
-  // Recompute junction shapes for connected junctions
+  // Recompute affected junctions with the SUMO-style node-shape algorithm.
   fromJunction.shape = computeNodeShape(fromJunction, network.edges);
   toJunction.shape = computeNodeShape(toJunction, network.edges);
 

@@ -11,76 +11,28 @@ import {
   sub,
   scale,
   normalize,
-  perpRight,
+  offsetPolyline,
   SUMO_DEFAULT_LANE_WIDTH,
   angle as vecAngle,
-  lineIntersection,
   dist,
   convexHull,
-  dot,
 } from "./geometry";
 
 const DEFAULT_RADIUS = 1.5;
 const MIN_SETBACK = 2.5;
+const EXT = 100;
+const EXT2 = 10;
 
 interface EdgeEnd {
   edge: SUMOEdge;
-  isIncoming: boolean;
-  /** Direction pointing AWAY from the junction */
   dir: XY;
-  /** Angle of dir for sorting */
   ang: number;
+  totalWidth: number;
   halfWidth: number;
-  /** The outer-right boundary point at the node */
-  ccwBoundary: XY;
-  /** The outer-left boundary point at the node */
-  cwBoundary: XY;
-}
-
-function computeGapCorner(curr: EdgeEnd, next: EdgeEnd, nodePos: XY): XY | null {
-  const p1 = curr.cwBoundary;
-  const d1 = curr.dir;
-  const p2 = next.ccwBoundary;
-  const d2 = next.dir;
-
-  const t = lineIntersection(p1, d1, p2, d2);
-  const u = lineIntersection(p2, d2, p1, d1);
-  if (t === null || u === null || isNaN(t) || isNaN(u)) return null;
-
-  // The corner must lie "inside" the junction, i.e. behind both boundaries
-  // when following edge directions away from the node.
-  if (t > 1e-6 || u > 1e-6) return null;
-
-  const ix = add(p1, scale(d1, t));
-  const maxDist = Math.max(curr.halfWidth, next.halfWidth) * 3 + 5;
-  return dist(ix, nodePos) < maxDist ? ix : null;
-}
-
-function twoEdgeShape(a: EdgeEnd, b: EdgeEnd, nodePos: XY): XY[] {
-  const setbackA = Math.max(MIN_SETBACK, a.halfWidth + 0.5);
-  const setbackB = Math.max(MIN_SETBACK, b.halfWidth + 0.5);
-
-  const points: XY[] = [
-    add(a.ccwBoundary, scale(a.dir, -setbackA)),
-    add(a.cwBoundary, scale(a.dir, -setbackA)),
-    add(b.ccwBoundary, scale(b.dir, -setbackB)),
-    add(b.cwBoundary, scale(b.dir, -setbackB)),
-  ];
-
-  const cornerAB = computeGapCorner(a, b, nodePos);
-  if (cornerAB) points.push(cornerAB);
-  const cornerBA = computeGapCorner(b, a, nodePos);
-  if (cornerBA) points.push(cornerBA);
-
-  const dedup: XY[] = [];
-  const eps = 1e-3;
-  for (const p of points) {
-    const exists = dedup.some((q) => dist(p, q) < eps);
-    if (!exists) dedup.push(p);
-  }
-
-  if (dedup.length < 3) return fallbackShape(nodePos, [a, b]);
-  return sanitizePolygon(dedup, nodePos, [a, b]);
+  /** Counter-clockwise (left) edge boundary, oriented away from node */
+  ccwBoundary: XY[];
+  /** Clockwise (right) edge boundary, oriented away from node */
+  cwBoundary: XY[];
 }
 
 /**
@@ -99,19 +51,10 @@ export function computeNodeShape(
   const edgeEnds: EdgeEnd[] = [];
 
   edges.forEach((edge) => {
-    if (edge.from === junction.id) {
-      const dir =
-        edge.shape.length >= 2
-          ? normalize(sub(edge.shape[1], edge.shape[0]))
-          : ([1, 0] as XY);
-      pushEdgeEnd(edgeEnds, edge, false, dir, nodePos);
-    }
-    if (edge.to === junction.id) {
-      const dir =
-        edge.shape.length >= 2
-          ? normalize(sub(edge.shape[edge.shape.length - 2], edge.shape[edge.shape.length - 1]))
-          : ([-1, 0] as XY);
-      pushEdgeEnd(edgeEnds, edge, true, dir, nodePos);
+    if (edge.from !== junction.id && edge.to !== junction.id) return;
+    const end = buildEdgeEnd(edge, junction, nodePos);
+    if (end) {
+      edgeEnds.push(end);
     }
   });
 
@@ -129,44 +72,98 @@ export function computeNodeShape(
     return deadEndShape(edgeEnds[0], nodePos);
   }
 
-  // Sort CCW by angle (SUMO's Y-up coord system)
+  // Sort by direction around the node and compute neighbor-based cut offsets.
   edgeEnds.sort((a, b) => a.ang - b.ang);
-
-  if (edgeEnds.length === 2) {
-    return twoEdgeShape(edgeEnds[0], edgeEnds[1], nodePos);
-  }
-
   const n = edgeEnds.length;
-  const shapePoints: XY[] = [];
-
+  const offsets: Array<[number, number]> = [];
   for (let i = 0; i < n; i++) {
     const curr = edgeEnds[i];
+    const prev = edgeEnds[(i - 1 + n) % n];
     const next = edgeEnds[(i + 1) % n];
+    const defaultOffset = EXT + Math.max(MIN_SETBACK, curr.halfWidth);
 
-    // Between curr and next there is a gap.
-    // curr's CW (left-looking-away) boundary faces next's CCW (right-looking-away) boundary.
-    //
-    // In SUMO coords (Y-up), looking away from node along the edge:
-    //   right = perpRight(dir)  → CW side of that edge as seen from the gap
-    //   left  = -perpRight(dir) → CCW side
-    //
-    // The boundary we want on curr's side of the gap is curr's CW boundary.
-    // The boundary we want on next's side of the gap is next's CCW boundary.
+    const ccwOffset = closestIntersectionOffset(curr.ccwBoundary, prev.cwBoundary, EXT);
+    const cwOffset = closestIntersectionOffset(curr.cwBoundary, next.ccwBoundary, EXT);
 
-    const corner = computeGapCorner(curr, next, nodePos);
-    if (corner) {
-      shapePoints.push(corner);
-      continue;
+    let finalCCW = ccwOffset === null ? defaultOffset : ccwOffset + MIN_SETBACK;
+    let finalCW = cwOffset === null ? defaultOffset : cwOffset + MIN_SETBACK;
+
+    // Preserve roughly rectangular cuts unless the two sides diverge strongly.
+    if (Math.abs(finalCCW - finalCW) < 5) {
+      const merged = Math.max(finalCCW, finalCW);
+      finalCCW = merged;
+      finalCW = merged;
     }
-
-    // Fallback for parallel/collinear edges or very far intersections:
-    // two separate points pulled inward
-    const setback = Math.max(MIN_SETBACK, Math.max(curr.halfWidth, next.halfWidth) + 0.5);
-    shapePoints.push(add(curr.cwBoundary, scale(curr.dir, -setback)));
-    shapePoints.push(add(next.ccwBoundary, scale(next.dir, -setback)));
+    offsets.push([finalCCW, finalCW]);
   }
 
-  return shapePoints.length >= 3 ? sanitizePolygon(shapePoints, nodePos, edgeEnds) : fallbackShape(nodePos, edgeEnds);
+  const ret: XY[] = [];
+  for (let i = 0; i < n; i++) {
+    const curr = edgeEnds[i];
+    const [offCCW, offCW] = offsets[i];
+    ret.push(pointAtOffset(curr.ccwBoundary, offCCW));
+    ret.push(pointAtOffset(curr.cwBoundary, offCW));
+  }
+  return finalizeOrderedPolygon(ret, nodePos, edgeEnds);
+}
+
+function buildEdgeEnd(edge: SUMOEdge, junction: SUMOJunction, nodePos: XY): EdgeEnd | null {
+  const oriented = orientEdgeShapeAwayFromNode(edge, junction.id, nodePos);
+  if (oriented.length < 2) return null;
+  const dir = directionAtStart(oriented);
+  if (Math.abs(dir[0]) < 1e-8 && Math.abs(dir[1]) < 1e-8) return null;
+
+  const defaultLaneWidth = edge.width || SUMO_DEFAULT_LANE_WIDTH;
+  const [minRightCoord, maxRightCoord] = computeLateralBounds(edge, defaultLaneWidth);
+  const totalWidth = Math.max(1e-3, maxRightCoord - minRightCoord);
+  const ccwBoundary = buildBoundary(oriented, minRightCoord, totalWidth);
+  const cwBoundary = buildBoundary(oriented, maxRightCoord, totalWidth);
+
+  return {
+    edge,
+    dir,
+    ang: vecAngle(dir),
+    totalWidth,
+    halfWidth: Math.max(0.5, totalWidth / 2),
+    ccwBoundary,
+    cwBoundary,
+  };
+}
+
+function orientEdgeShapeAwayFromNode(edge: SUMOEdge, nodeId: string, nodePos: XY): XY[] {
+  if (edge.shape.length === 0) return [];
+  let oriented: XY[];
+  if (edge.from === nodeId) {
+    oriented = edge.shape.map((p) => [p[0], p[1]] as XY);
+  } else if (edge.to === nodeId) {
+    oriented = [...edge.shape].reverse().map((p) => [p[0], p[1]] as XY);
+  } else {
+    return [];
+  }
+
+  if (dist(oriented[0], nodePos) > 1e-3) {
+    oriented.unshift([nodePos[0], nodePos[1]]);
+  }
+  return oriented;
+}
+
+function directionAtStart(shape: XY[]): XY {
+  for (let i = 1; i < shape.length; i++) {
+    const dir = normalize(sub(shape[i], shape[0]));
+    if (Math.abs(dir[0]) > 1e-8 || Math.abs(dir[1]) > 1e-8) return dir;
+  }
+  return [0, 0];
+}
+
+function buildBoundary(orientedCenter: XY[], sideOffset: number, totalWidth: number): XY[] {
+  let boundary = offsetPolyline(orientedCenter, sideOffset);
+  if (boundary.length < 2) {
+    boundary = orientedCenter;
+  }
+  boundary = truncatePolyline(boundary, Math.max(EXT, totalWidth));
+  boundary = extrapolateStart(boundary, EXT);
+  boundary = extrapolateEnd(boundary, EXT2);
+  return boundary;
 }
 
 function isSelfIntersecting(poly: XY[]): boolean {
@@ -219,12 +216,7 @@ function onSegment(a: XY, b: XY, p: XY): boolean {
 }
 
 function sanitizePolygon(points: XY[], nodePos: XY, edgeEnds: EdgeEnd[]): XY[] {
-  const dedup: XY[] = [];
-  const eps = 1e-3;
-  for (const p of points) {
-    const exists = dedup.some((q) => dist(p, q) < eps);
-    if (!exists) dedup.push(p);
-  }
+  const dedup = dedupePoints(points, 1e-3);
 
   if (dedup.length < 3) return fallbackShape(nodePos, edgeEnds);
 
@@ -238,61 +230,68 @@ function sanitizePolygon(points: XY[], nodePos: XY, edgeEnds: EdgeEnd[]): XY[] {
   return hull.length >= 3 ? hull : fallbackShape(nodePos, edgeEnds);
 }
 
-function pushEdgeEnd(
-  out: EdgeEnd[],
-  edge: SUMOEdge,
-  isIncoming: boolean,
-  dir: XY,
-  nodePos: XY
-): void {
-  const defaultLaneWidth = edge.width || SUMO_DEFAULT_LANE_WIDTH;
-  const totalWidth = edge.numLanes * defaultLaneWidth;
-  // perpRight gives the rightward normal when looking along dir (Y-up system)
-  const right = perpRight(dir);
-  let minRightCoord = Number.POSITIVE_INFINITY;
-  let maxRightCoord = Number.NEGATIVE_INFINITY;
+function dedupePoints(points: XY[], eps: number): XY[] {
+  const dedup: XY[] = [];
+  for (const p of points) {
+    const exists = dedup.some((q) => dist(p, q) < eps);
+    if (!exists) dedup.push(p);
+  }
+  return dedup;
+}
 
-  for (const lane of edge.lanes) {
-    if (lane.shape.length < 1) continue;
-    const centerAtNode = isIncoming ? lane.shape[lane.shape.length - 1] : lane.shape[0];
-    const centerCoord = dot(sub(centerAtNode, nodePos), right);
-    const halfLaneWidth = (lane.width || defaultLaneWidth) / 2;
-    minRightCoord = Math.min(minRightCoord, centerCoord - halfLaneWidth);
-    maxRightCoord = Math.max(maxRightCoord, centerCoord + halfLaneWidth);
+function computeLateralBounds(edge: SUMOEdge, defaultLaneWidth: number): [number, number] {
+  const laneCount = Math.max(1, edge.numLanes || edge.lanes.length || 1);
+  const sorted = edge.lanes.length
+    ? [...edge.lanes].sort((a, b) => a.index - b.index)
+    : Array.from({ length: laneCount }, (_, i) => ({
+        index: i,
+        width: defaultLaneWidth,
+      }));
+
+  const widths = sorted.map((lane) => (lane.width && lane.width > 0 ? lane.width : defaultLaneWidth));
+  const total = widths.reduce((sum, w) => sum + w, 0);
+  const spreadType = edge.spreadType || "right";
+
+  if (spreadType === "right") {
+    // SUMO "right": lane block starts at centerline and extends to positive right side.
+    let cursor = 0;
+    let min = Number.POSITIVE_INFINITY;
+    let max = Number.NEGATIVE_INFINITY;
+    for (const w of widths) {
+      const start = cursor;
+      const end = cursor + w;
+      min = Math.min(min, start);
+      max = Math.max(max, end);
+      cursor = end;
+    }
+    return [min, max];
   }
 
-  // Fall back to a simple centered span if lane geometry is not available.
-  if (!Number.isFinite(minRightCoord) || !Number.isFinite(maxRightCoord)) {
-    minRightCoord = -totalWidth / 2;
-    maxRightCoord = totalWidth / 2;
+  // center / roadCenter: symmetric around edge centerline.
+  let cursor = -total / 2;
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const w of widths) {
+    const start = cursor;
+    const end = cursor + w;
+    min = Math.min(min, start);
+    max = Math.max(max, end);
+    cursor = end;
   }
-
-  const ccwBoundary = add(nodePos, scale(right, maxRightCoord));
-  const cwBoundary = add(nodePos, scale(right, minRightCoord));
-  const halfWidth = Math.max(0.5, (maxRightCoord - minRightCoord) / 2);
-
-  out.push({
-    edge,
-    isIncoming,
-    dir,
-    ang: vecAngle(dir),
-    halfWidth,
-    ccwBoundary,
-    cwBoundary,
-  });
+  return [min, max];
 }
 
 function deadEndShape(e: EdgeEnd, nodePos: XY): XY[] {
-  const hw = e.halfWidth + 0.5;
-  const right = perpRight(e.dir);
-  const setback = Math.max(MIN_SETBACK, e.halfWidth);
-  const back = scale(e.dir, -setback);
-  // Rectangle: two points at road width, two pulled back
+  const setback = EXT + Math.max(MIN_SETBACK, e.halfWidth);
+  const leftNear = pointAtOffset(e.ccwBoundary, EXT);
+  const leftFar = pointAtOffset(e.ccwBoundary, setback);
+  const rightFar = pointAtOffset(e.cwBoundary, setback);
+  const rightNear = pointAtOffset(e.cwBoundary, EXT);
   return [
-    add(nodePos, scale(right, hw)),
-    add(add(nodePos, scale(right, hw)), back),
-    add(add(nodePos, scale(right, -hw)), back),
-    add(nodePos, scale(right, -hw)),
+    leftNear,
+    leftFar,
+    rightFar,
+    rightNear,
   ];
 }
 
@@ -305,6 +304,115 @@ function fallbackShape(nodePos: XY, edgeEnds: EdgeEnd[]): XY[] {
     [nodePos[0] + r, nodePos[1] + r],
     [nodePos[0] - r, nodePos[1] + r],
   ];
+}
+
+function finalizeOrderedPolygon(points: XY[], nodePos: XY, edgeEnds: EdgeEnd[]): XY[] {
+  const dedup = dedupePoints(points, 1e-3);
+  if (dedup.length < 3) return fallbackShape(nodePos, edgeEnds);
+  if (isSelfIntersecting(dedup)) {
+    const hull = convexHull(dedup);
+    return hull.length >= 3 ? hull : fallbackShape(nodePos, edgeEnds);
+  }
+  return dedup;
+}
+
+function closestIntersectionOffset(a: XY[], b: XY[], target: number): number | null {
+  const offsets = polylineIntersectionsOffsets(a, b);
+  if (offsets.length === 0) return null;
+  let best = offsets[0];
+  let bestDelta = Math.abs(best - target);
+  for (let i = 1; i < offsets.length; i++) {
+    const d = Math.abs(offsets[i] - target);
+    if (d < bestDelta) {
+      bestDelta = d;
+      best = offsets[i];
+    }
+  }
+  return best;
+}
+
+function polylineIntersectionsOffsets(a: XY[], b: XY[]): number[] {
+  if (a.length < 2 || b.length < 2) return [];
+  const offsets: number[] = [];
+  let traveledA = 0;
+  const eps = 1e-8;
+
+  for (let i = 0; i < a.length - 1; i++) {
+    const a1 = a[i];
+    const a2 = a[i + 1];
+    const lenA = dist(a1, a2);
+    if (lenA < eps) continue;
+
+    for (let j = 0; j < b.length - 1; j++) {
+      const b1 = b[j];
+      const b2 = b[j + 1];
+      const t = segmentIntersectionParam(a1, a2, b1, b2);
+      if (t === null || t < -eps || t > 1 + eps) continue;
+      const clamped = Math.max(0, Math.min(1, t));
+      offsets.push(traveledA + clamped * lenA);
+    }
+    traveledA += lenA;
+  }
+  return offsets;
+}
+
+function pointAtOffset(shape: XY[], offset: number): XY {
+  if (shape.length === 0) return [0, 0];
+  if (shape.length === 1) return shape[0];
+  if (offset <= 0) return shape[0];
+
+  let traveled = 0;
+  for (let i = 0; i < shape.length - 1; i++) {
+    const a = shape[i];
+    const b = shape[i + 1];
+    const seg = dist(a, b);
+    if (seg < 1e-10) continue;
+    if (traveled + seg >= offset) {
+      const t = (offset - traveled) / seg;
+      return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+    }
+    traveled += seg;
+  }
+  return shape[shape.length - 1];
+}
+
+function truncatePolyline(shape: XY[], maxLen: number): XY[] {
+  if (shape.length < 2 || maxLen <= 0) return shape.slice(0, 1);
+  let traveled = 0;
+  const out: XY[] = [shape[0]];
+
+  for (let i = 0; i < shape.length - 1; i++) {
+    const a = shape[i];
+    const b = shape[i + 1];
+    const seg = dist(a, b);
+    if (seg < 1e-10) continue;
+    if (traveled + seg <= maxLen) {
+      out.push(b);
+      traveled += seg;
+      continue;
+    }
+    const t = (maxLen - traveled) / seg;
+    out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+    break;
+  }
+  return out;
+}
+
+function extrapolateStart(shape: XY[], amount: number): XY[] {
+  if (shape.length < 2 || amount <= 0) return shape;
+  const dir = normalize(sub(shape[1], shape[0]));
+  if (Math.abs(dir[0]) < 1e-10 && Math.abs(dir[1]) < 1e-10) return shape;
+  const start = add(shape[0], scale(dir, -amount));
+  return [start, ...shape];
+}
+
+function extrapolateEnd(shape: XY[], amount: number): XY[] {
+  if (shape.length < 2 || amount <= 0) return shape;
+  const n = shape.length;
+  const dir = normalize(sub(shape[n - 1], shape[n - 2]));
+  if (Math.abs(dir[0]) < 1e-10 && Math.abs(dir[1]) < 1e-10) return shape;
+  const end = add(shape[n - 1], scale(dir, amount));
+  return [...shape, end];
 }
 
 // ─── Edge trimming ───
