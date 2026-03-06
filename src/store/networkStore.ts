@@ -16,6 +16,7 @@ import {
   addConnection,
   removeConnection,
   createEmptyNetwork,
+  recomputeLaneShapes,
 } from "@/lib/sumo/network";
 import { generateTLSProgram } from "@/lib/sumo/tlsGenerate";
 import {
@@ -69,6 +70,7 @@ interface NetworkState {
   historyIndex: number;
   isComputing: boolean;
   computeError: string | null;
+  networkVersion: number; // Increment on mutations to trigger React re-renders
 
   /** The last-computed (or initially-loaded) net.xml, used as base for patch-mode netconvert. */
   baseNetXML: string | null;
@@ -98,6 +100,7 @@ interface NetworkState {
   rebuild: () => void;
   exportXML: () => string;
   clearComputeError: () => void;
+  pushHistory: () => void; // Expose for drag operations
 
   // Mutations (all push to history)
   doAddJunction: (x: number, y: number, type?: JunctionType) => string | null;
@@ -109,6 +112,7 @@ interface NetworkState {
   doSetEdgeAttribute: (id: string, attr: string, value: any) => void;
   doSetLaneAttribute: (id: string, attr: string, value: any) => void;
   doMoveGeometryPoint: (edgeId: string, pointIndex: number, pos: XY) => void;
+  doMoveGeometryPointDrag: (edgeId: string, pointIndex: number, pos: XY) => void; // For drag updates (no history)
   doAddGeometryPoint: (edgeId: string, afterIndex: number, pos: XY) => void;
   doRemoveGeometryPoint: (edgeId: string, pointIndex: number) => void;
   doAddConnection: (from: string, to: string, fromLane: number, toLane: number) => void;
@@ -268,6 +272,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
     isComputing: false,
     computeError: null,
     baseNetXML: null,
+    networkVersion: 0,
     accumulatedPatches: {
       nodXML: null,
       edgXML: null,
@@ -324,6 +329,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
     },
 
     rebuild: () => rebuildRenderable(),
+
+    pushHistory: () => pushHistory(),
 
     exportXML: () => {
       const { network } = get();
@@ -473,6 +480,35 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       moveEdgeGeometryPoint(network, edgeId, pointIndex, pos);
       markDirtyEdge(edgeId);
       rebuildRenderable();
+    },
+
+    doMoveGeometryPointDrag: (edgeId, pointIndex, pos) => {
+      // For drag updates - update network state directly without pushing history
+      // History should be pushed once at drag start
+      // During drag, compute lane geometry directly from edge shape for immediate UI feedback
+      const { network, networkVersion } = get();
+      if (!network) return;
+      
+      // Update edge shape
+      moveEdgeGeometryPoint(network, edgeId, pointIndex, pos);
+      
+      // Compute lane shapes directly from the updated edge shape
+      // This ensures lanes update interactively during drag
+      const edge = network.edges.get(edgeId);
+      if (edge) {
+        recomputeLaneShapes(edge, network);
+      }
+      
+      markDirtyEdge(edgeId);
+      
+      // Rebuild renderable immediately - getTrimmedLaneShape will trim the computed lane shapes
+      const newRenderable = buildRenderableNetwork(network);
+      
+      // Update state to trigger React re-render
+      set({ 
+        renderable: newRenderable,
+        networkVersion: networkVersion + 1,
+      });
     },
 
     doAddGeometryPoint: (edgeId, afterIndex, pos) => {

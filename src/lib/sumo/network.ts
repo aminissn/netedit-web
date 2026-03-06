@@ -323,7 +323,11 @@ export function moveEdgeGeometryPoint(
   const edge = network.edges.get(edgeId);
   if (!edge || pointIndex < 0 || pointIndex >= edge.shape.length) return;
   edge.shape[pointIndex] = newPos;
-  // Do NOT compute lane shapes here - netconvert will compute them
+  // Clear lane shapes so they recompute from edge shape during rendering
+  // This ensures lanes update interactively when dragging geometry points
+  for (const lane of edge.lanes) {
+    lane.shape = [];
+  }
 }
 
 export function addEdgeGeometryPoint(
@@ -422,7 +426,7 @@ function getLaneOffsetFromCenter(
   return (laneIndex - (numLanes - 1) / 2) * laneWidth;
 }
 
-function recomputeLaneShapes(edge: SUMOEdge, network?: SUMONetwork): void {
+export function recomputeLaneShapes(edge: SUMOEdge, network?: SUMONetwork): void {
   for (const lane of edge.lanes) {
     lane.shape = computeLaneShape(edge.shape, lane.index, edge.numLanes, edge.spreadType);
     

@@ -31,6 +31,7 @@ const INITIAL_VIEW: MapViewState = {
 export default function NetworkMap() {
   const renderable = useNetworkStore((s) => s.renderable);
   const network = useNetworkStore((s) => s.network);
+  const networkVersion = useNetworkStore((s) => s.networkVersion);
   const projection = useNetworkStore((s) => s.projection);
   const store = useNetworkStore;
 
@@ -101,7 +102,7 @@ export default function NetworkMap() {
         edgeId: e.id,
       }))
     );
-  }, [renderable]);
+  }, [renderable, networkVersion]);
 
   const laneLayer = useMemo(
     () =>
@@ -130,9 +131,10 @@ export default function NetworkMap() {
         capRounded: true,
         updateTriggers: {
           getColor: [selection, hoverElement, editMode],
+          getPath: [networkVersion],
         },
       }),
-    [lanePaths, selection, hoverElement, editMode]
+    [lanePaths, selection, hoverElement, editMode, networkVersion]
   );
 
   const junctionLayer = useMemo(
@@ -217,9 +219,9 @@ export default function NetworkMap() {
     [renderable?.connections, selection, editMode, getConnectionColor, selectedTLSPhase]
   );
 
-  // Geometry points for selected edge (in move mode)
+  // Geometry points for selected edge (in inspect mode)
   const geometryPoints = useMemo(() => {
-    if (editMode !== "move" || !selection || selection.type !== "edge" || !network || !projection)
+    if (editMode !== "inspect" || !selection || selection.type !== "edge" || !network || !projection)
       return [];
     const edge = network.edges.get(selection.id);
     if (!edge) return [];
@@ -228,7 +230,7 @@ export default function NetworkMap() {
       index: i,
       edgeId: edge.id,
     }));
-  }, [editMode, selection, network, projection]);
+  }, [editMode, selection, network, networkVersion, projection]);
 
   const geometryPointLayer = useMemo(
     () =>
@@ -571,13 +573,17 @@ export default function NetworkMap() {
             setSelection({ type: "junction", id: (info.object as any).id });
           } else if (info.layer?.id === "lanes") {
             const obj = info.object as any;
-            setSelection({ type: "lane", id: obj.id, subId: obj.edgeId });
+            // When clicking a lane, select the edge instead
+            setSelection({ type: "edge", id: obj.edgeId });
           } else if (info.layer?.id === "connections") {
             const obj = info.object as RenderableConnection;
             setSelection({
               type: "connection",
               id: `${obj.from}_${obj.fromLane}-${obj.to}_${obj.toLane}`,
             });
+          } else if (info.layer?.id === "geometry-points") {
+            // Don't change selection when clicking geometry points
+            return;
           } else {
             setSelection(null);
           }
@@ -693,6 +699,8 @@ export default function NetworkMap() {
     [editMode, finalizeDraw]
   );
 
+  const [hoveredLayer, setHoveredLayer] = React.useState<string | null>(null);
+
   const handleHover = useCallback(
     (info: PickingInfo) => {
       if (info.coordinate) {
@@ -700,11 +708,17 @@ export default function NetworkMap() {
       }
       if (info.layer?.id === "junctions" && info.object) {
         setHoverElement({ type: "junction", id: (info.object as any).id });
+        setHoveredLayer("junctions");
       } else if (info.layer?.id === "lanes" && info.object) {
         const obj = info.object as any;
         setHoverElement({ type: "lane", id: obj.id });
+        setHoveredLayer("lanes");
+      } else if (info.layer?.id === "geometry-points" && info.object) {
+        setHoverElement(null);
+        setHoveredLayer("geometry-points");
       } else {
         setHoverElement(null);
+        setHoveredLayer(null);
       }
     },
     [setHoverElement, setCursorPosition]
@@ -712,15 +726,17 @@ export default function NetworkMap() {
 
   const handleDragStart = useCallback(
     (info: PickingInfo) => {
-      if (editMode !== "move" || !info.object) return;
+      if (editMode !== "inspect" || !info.object) return;
 
       if (info.layer?.id === "geometry-points") {
         const obj = info.object as any;
         dragRef.current = { edgeId: obj.edgeId, pointIndex: obj.index };
+        // Push history once at drag start for geometry point moves
+        store.getState().pushHistory();
         return;
       }
     },
-    [editMode]
+    [editMode, store]
   );
 
   const handleDrag = useCallback(
@@ -729,9 +745,10 @@ export default function NetworkMap() {
 
       const sumoPos = projection.lngLatToSumo([info.coordinate[0], info.coordinate[1]]);
 
-      if (editMode === "move") {
+      if (editMode === "inspect") {
         if (dragRef.current) {
-          store.getState().doMoveGeometryPoint(
+          // Use drag-specific method that updates without pushing history
+          store.getState().doMoveGeometryPointDrag(
             dragRef.current.edgeId,
             dragRef.current.pointIndex,
             sumoPos
@@ -741,7 +758,7 @@ export default function NetworkMap() {
         }
       }
     },
-    [editMode, selection, projection]
+    [editMode, selection, projection, store]
   );
 
   const handleDragEnd = useCallback(() => {
@@ -760,15 +777,19 @@ export default function NetworkMap() {
           return createEdgeFromJunction ? "crosshair" : "pointer";
         case "delete":
           return "pointer";
-        case "move":
-          return "grab";
+        case "inspect":
+          // Show grab cursor when hovering over draggable items (junctions, geometry points)
+          if (hoverElement?.type === "junction" || hoveredLayer === "geometry-points") {
+            return "grab";
+          }
+          return "default";
         case "connection":
           return connectionFromEdge ? "crosshair" : "pointer";
         default:
           return "default";
       }
     },
-    [editMode, createEdgeFromJunction, connectionFromEdge]
+    [editMode, createEdgeFromJunction, connectionFromEdge, hoverElement, hoveredLayer]
   );
 
   return (
@@ -776,7 +797,7 @@ export default function NetworkMap() {
       viewState={viewState}
       onViewStateChange={({ viewState: vs }: { viewState: MapViewState }) => setViewState(vs)}
       controller={{
-        dragPan: editMode !== "move" || (!selection && !dragRef.current),
+        dragPan: editMode !== "inspect" || (!selection && !dragRef.current),
         doubleClickZoom: editMode !== "draw",
       }}
       layers={layers}
