@@ -32,9 +32,7 @@ function parseShape(shapeStr: string): XY[] {
       const parts = pair.split(",");
       const x = parseFloat(parts[0]);
       const y = parseFloat(parts[1]);
-      // Round to reasonable precision to avoid floating point issues
-      // SUMO typically uses ~2-3 decimal places for coordinates
-      return [Math.round(x * 1000) / 1000, Math.round(y * 1000) / 1000] as XY;
+      return [x, y] as XY;
     })
     .filter((xy) => !isNaN(xy[0]) && !isNaN(xy[1]));
 }
@@ -45,7 +43,7 @@ function parseShape(shapeStr: string): XY[] {
 function parseCoord(value: string | null, defaultValue: number = 0): number {
   if (!value) return defaultValue;
   const n = parseFloat(value);
-  return isNaN(n) ? defaultValue : Math.round(n * 1000) / 1000;
+  return isNaN(n) ? defaultValue : n;
 }
 
 function parseStringList(str: string): string[] {
@@ -71,22 +69,6 @@ function intAttr(el: Element, name: string, def = 0): number {
   return isNaN(n) ? def : n;
 }
 
-/**
- * Convert coordinates using SUMO's coordinate system.
- * In SUMO net.xml, coordinates are stored in "net" coordinate system.
- * This function ensures coordinates are properly interpreted.
- * 
- * Equivalent to sumolib.net.convertXY2LonLat / convertLonLat2XY logic.
- */
-function ensureNetCoordinates(
-  xy: XY,
-  location: SUMOLocation
-): XY {
-  // Coordinates in XML are already in net coordinate system
-  // net_coord = proj_coord + offset
-  // So we use them as-is, but ensure they're properly rounded
-  return [Math.round(xy[0] * 1000) / 1000, Math.round(xy[1] * 1000) / 1000];
-}
 
 function inferEdgeCenterLine(
   lanes: SUMOLane[],
@@ -161,8 +143,6 @@ export function parseNetXML(xmlString: string): SUMONetwork {
     // Parse and normalize junction shape
     const shapeStr = attr(el, "shape");
     let shape = parseShape(shapeStr);
-    // Ensure shape coordinates are normalized
-    shape = shape.map((xy) => ensureNetCoordinates(xy, location));
     
     // If shape is empty or invalid, create a default shape centered at junction position
     // This ensures the junction always has a valid shape
@@ -204,7 +184,6 @@ export function parseNetXML(xmlString: string): SUMONetwork {
     el.querySelectorAll("lane").forEach((laneEl) => {
       // Parse and normalize lane shape coordinates
       let laneShape = parseShape(attr(laneEl, "shape"));
-      laneShape = laneShape.map((xy) => ensureNetCoordinates(xy, location));
       
       lanes.push({
         id: attr(laneEl, "id"),
@@ -226,7 +205,7 @@ export function parseNetXML(xmlString: string): SUMONetwork {
     const rawEdgeShape = parseShape(attr(el, "shape"));
     const edgeShape =
       rawEdgeShape.length > 0
-        ? rawEdgeShape.map((xy) => ensureNetCoordinates(xy, location))
+        ? rawEdgeShape
         : inferEdgeCenterLine(lanes, fromJunction, toJunction);
 
     edges.set(id, {

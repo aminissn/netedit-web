@@ -1,9 +1,11 @@
 import { spawn } from "child_process";
 import { constants } from "fs";
-import { mkdtemp, readFile, rm, writeFile, access } from "fs/promises";
+import { mkdtemp, readFile, rm, writeFile, access, mkdir, copyFile } from "fs/promises";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, resolve } from "path";
 import { NextResponse } from "next/server";
+
+const DEBUG_DIR = resolve(process.cwd(), "public", "netconvert-debug");
 
 export const runtime = "nodejs";
 
@@ -79,14 +81,48 @@ function runCommand(cmd: string, args: string[]): Promise<CommandResult> {
   });
 }
 
+/**
+ * Accepts either:
+ * 1. Plain XML body (legacy: full net.xml) with Content-Type: application/xml
+ * 2. JSON body with patch files:
+ *    { baseNetXML: string, nodXML?: string, edgXML?: string, conXML?: string, tllXML?: string }
+ */
 export async function POST(req: Request) {
-  const xml = await req.text();
-  if (!xml || !xml.trim()) {
-    return NextResponse.json(
-      { error: "Request body must contain net.xml content." },
-      { status: 400 }
-    );
+  const contentType = req.headers.get("content-type") ?? "";
+  const isJSON = contentType.includes("application/json");
+
+  let baseNetXML: string;
+  let nodXML: string | undefined;
+  let edgXML: string | undefined;
+  let conXML: string | undefined;
+  let tllXML: string | undefined;
+
+  if (isJSON) {
+    const body = await req.json();
+    baseNetXML = body.baseNetXML;
+    nodXML = body.nodXML;
+    edgXML = body.edgXML;
+    conXML = body.conXML;
+    tllXML = body.tllXML;
+
+    if (!baseNetXML || !baseNetXML.trim()) {
+      return NextResponse.json(
+        { error: "baseNetXML is required." },
+        { status: 400 }
+      );
+    }
+  } else {
+    // Legacy: plain XML body
+    baseNetXML = await req.text();
+    if (!baseNetXML || !baseNetXML.trim()) {
+      return NextResponse.json(
+        { error: "Request body must contain net.xml content." },
+        { status: 400 }
+      );
+    }
   }
+
+  const hasPatchFiles = !!(nodXML || edgXML || conXML || tllXML);
 
   const workDir = await mkdtemp(join(tmpdir(), "netedit-netconvert-"));
   const inputPath = join(workDir, "input.net.xml");
@@ -94,31 +130,80 @@ export async function POST(req: Request) {
   const netconvertCandidates = await resolveNetconvertCandidates();
 
   try {
-    await writeFile(inputPath, xml, "utf8");
+    await writeFile(inputPath, baseNetXML, "utf8");
 
+    // Write patch files if present
+    const nodPath = join(workDir, "patch.nod.xml");
+    const edgPath = join(workDir, "patch.edg.xml");
+    const conPath = join(workDir, "patch.con.xml");
+    const tllPath = join(workDir, "patch.tll.xml");
+
+    if (nodXML) await writeFile(nodPath, nodXML, "utf8");
+    if (edgXML) await writeFile(edgPath, edgXML, "utf8");
+    if (conXML) await writeFile(conPath, conXML, "utf8");
+    if (tllXML) await writeFile(tllPath, tllXML, "utf8");
+
+    // Build netconvert args
     const args = [
-      "--sumo-net-file",
-      inputPath,
-      "--output-file",
-      outputPath,
+      "--sumo-net-file", inputPath,
+      "--output-file", outputPath,
     ];
+
+    if (hasPatchFiles) {
+      // Patch mode: apply partial changes on top of base network
+      if (nodXML) args.push("--node-files", nodPath);
+      if (edgXML) args.push("--edge-files", edgPath);
+      if (conXML) args.push("--connection-files", conPath);
+      if (tllXML) args.push("--tllogic-files", tllPath);
+    }
+
+    // Save input files to public/netconvert-debug/ for inspection
+    try {
+      await mkdir(DEBUG_DIR, { recursive: true });
+      await copyFile(inputPath, join(DEBUG_DIR, "input.net.xml"));
+      if (nodXML) await copyFile(nodPath, join(DEBUG_DIR, "patch.nod.xml"));
+      if (edgXML) await copyFile(edgPath, join(DEBUG_DIR, "patch.edg.xml"));
+      if (conXML) await copyFile(conPath, join(DEBUG_DIR, "patch.con.xml"));
+      if (tllXML) await copyFile(tllPath, join(DEBUG_DIR, "patch.tll.xml"));
+    } catch (e) {
+      console.warn("[netconvert] Failed to save debug files:", e);
+    }
 
     let lastSpawnError = "";
     for (const netconvertBin of netconvertCandidates) {
+      console.log(`[netconvert] ${netconvertBin} ${args.join(" ")}`);
       try {
         const result = await runCommand(netconvertBin, args);
         if (result.code !== 0) {
+          // Combine both stdout and stderr for full error details
+          const fullError = [
+            result.stderr ? `STDERR:\n${result.stderr}` : "",
+            result.stdout ? `STDOUT:\n${result.stdout}` : "",
+            `Exit code: ${result.code}`,
+          ]
+            .filter(Boolean)
+            .join("\n\n");
+          
           return NextResponse.json(
             {
               error: "netconvert failed",
-              details: result.stderr || result.stdout || `Exit code ${result.code}`,
+              details: fullError || `Exit code ${result.code}`,
               bin: netconvertBin,
+              stderr: result.stderr,
+              stdout: result.stdout,
+              exitCode: result.code,
             },
             { status: 500 }
           );
         }
 
         const outputXml = await readFile(outputPath, "utf8");
+        // Also save the output for inspection
+        try {
+          await writeFile(join(DEBUG_DIR, "output.net.xml"), outputXml, "utf8");
+        } catch (e) {
+          console.warn("[netconvert] Failed to save debug output:", e);
+        }
         return new Response(outputXml, {
           status: 200,
           headers: { "Content-Type": "application/xml; charset=utf-8" },

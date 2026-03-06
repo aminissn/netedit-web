@@ -18,7 +18,13 @@ import {
   createEmptyNetwork,
 } from "@/lib/sumo/network";
 import { generateTLSProgram } from "@/lib/sumo/tlsGenerate";
-import { exportNetXML } from "@/lib/sumo/exporter";
+import {
+  exportNetXML,
+  exportPatchNodXML,
+  exportPatchEdgXML,
+  exportPatchConXML,
+  exportPatchTllXML,
+} from "@/lib/sumo/exporter";
 import { createProjection, type Projection } from "@/lib/sumo/projection";
 
 function deepCloneNetwork(net: SUMONetwork): SUMONetwork {
@@ -63,6 +69,19 @@ interface NetworkState {
   historyIndex: number;
   isComputing: boolean;
   computeError: string | null;
+
+  /** The last-computed (or initially-loaded) net.xml, used as base for patch-mode netconvert. */
+  baseNetXML: string | null;
+  /** Element IDs that changed since the last compute / load. */
+  dirtyNodes: Set<string>;
+  dirtyEdges: Set<string>;
+  dirtyTLS: Set<string>;
+  /** Edges whose numLanes changed — emit reset directives in con.xml */
+  resetConnectionEdges: Set<string>;
+  /** Individually added connections */
+  addedConnections: { from: string; to: string; fromLane: number; toLane: number }[];
+  /** Individually removed connections */
+  removedConnections: { from: string; to: string; fromLane: number; toLane: number }[];
 
   // Actions
   loadFromXML: (xml: string) => void;
@@ -141,6 +160,29 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
     });
   }
 
+  function clearDirty() {
+    set({
+      dirtyNodes: new Set<string>(),
+      dirtyEdges: new Set<string>(),
+      dirtyTLS: new Set<string>(),
+      resetConnectionEdges: new Set<string>(),
+      addedConnections: [],
+      removedConnections: [],
+    });
+  }
+
+  function markDirtyNode(id: string) {
+    get().dirtyNodes.add(id);
+  }
+
+  function markDirtyEdge(id: string) {
+    get().dirtyEdges.add(id);
+  }
+
+  function markDirtyTLS(id: string) {
+    get().dirtyTLS.add(id);
+  }
+
   function recomputeAndRebuild(network: SUMONetwork): void {
     // Keep imported/computed backend junction geometry stable in interactive edits.
     rebuildRenderable();
@@ -155,25 +197,50 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
     return tls;
   }
 
-  async function computeViaNetconvert(xml: string): Promise<string> {
-    const response = await fetch("/api/netconvert", {
-      method: "POST",
-      headers: { "Content-Type": "application/xml" },
-      body: xml,
-    });
+  async function computeViaNetconvert(payload: {
+    baseNetXML: string;
+    nodXML?: string;
+    edgXML?: string;
+    conXML?: string;
+    tllXML?: string;
+  }): Promise<string> {
+    const hasPatchFiles = !!(payload.nodXML || payload.edgXML || payload.conXML || payload.tllXML);
+
+    let response: Response;
+    if (hasPatchFiles) {
+      // Patch mode: send JSON with base + patch files
+      response = await fetch("/api/netconvert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } else {
+      // Full mode: send plain XML
+      response = await fetch("/api/netconvert", {
+        method: "POST",
+        headers: { "Content-Type": "application/xml" },
+        body: payload.baseNetXML,
+      });
+    }
+
     if (!response.ok) {
       let detail = "";
       try {
         const data = await response.json();
-        const parts = [
-          data?.error,
-          data?.details,
-          data?.bin ? `bin=${data.bin}` : "",
-          Array.isArray(data?.tried) && data.tried.length > 0
-            ? `tried=${data.tried.join(", ")}`
-            : "",
-        ].filter(Boolean);
-        detail = parts.join(" | ");
+        // Build comprehensive error message with all available details
+        const parts: string[] = [];
+        
+        if (data?.error) parts.push(`ERROR: ${data.error}`);
+        if (data?.details) parts.push(`\nDETAILS:\n${data.details}`);
+        if (data?.stderr) parts.push(`\nSTDERR:\n${data.stderr}`);
+        if (data?.stdout) parts.push(`\nSTDOUT:\n${data.stdout}`);
+        if (data?.bin) parts.push(`\nBinary: ${data.bin}`);
+        if (data?.exitCode !== undefined) parts.push(`\nExit code: ${data.exitCode}`);
+        if (Array.isArray(data?.tried) && data.tried.length > 0) {
+          parts.push(`\nTried binaries: ${data.tried.join(", ")}`);
+        }
+        
+        detail = parts.length > 0 ? parts.join("\n") : `netconvert request failed (${response.status})`;
       } catch {
         detail = await response.text();
       }
@@ -190,6 +257,13 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
     historyIndex: -1,
     isComputing: false,
     computeError: null,
+    baseNetXML: null,
+    dirtyNodes: new Set<string>(),
+    dirtyEdges: new Set<string>(),
+    dirtyTLS: new Set<string>(),
+    resetConnectionEdges: new Set<string>(),
+    addedConnections: [],
+    removedConnections: [],
 
     loadFromXML: (xml) => {
       const network = parseNetXML(xml);
@@ -200,11 +274,14 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         history: [deepCloneNetwork(network)],
         historyIndex: 0,
         computeError: null,
+        baseNetXML: xml,
       });
+      clearDirty();
     },
 
     createNew: (lng, lat) => {
       const network = createEmptyNetwork(lng, lat);
+      const xml = exportNetXML(network);
       set({
         network,
         renderable: buildRenderableNetwork(network),
@@ -212,7 +289,9 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         history: [deepCloneNetwork(network)],
         historyIndex: 0,
         computeError: null,
+        baseNetXML: xml,
       });
+      clearDirty();
     },
 
     rebuild: () => rebuildRenderable(),
@@ -229,8 +308,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return null;
       pushHistory();
       const j = addJunction(network, x, y, type);
-      // Adding an isolated junction should not trigger a full-network recompute,
-      // otherwise all imported junction polygons get recomputed and may drift.
+      markDirtyNode(j.id);
       rebuildRenderable();
       return j.id;
     },
@@ -240,6 +318,11 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       moveJunction(network, id, x, y);
+      markDirtyNode(id);
+      // Also mark edges connected to this junction
+      network.edges.forEach((edge) => {
+        if (edge.from === id || edge.to === id) markDirtyEdge(edge.id);
+      });
       recomputeAndRebuild(network);
     },
 
@@ -247,6 +330,12 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       const { network } = get();
       if (!network) return;
       pushHistory();
+      // Mark connected edges as dirty before removal
+      network.edges.forEach((edge) => {
+        if (edge.from === id || edge.to === id) markDirtyEdge(edge.id);
+      });
+      markDirtyNode(id);
+
       removeJunction(network, id);
       recomputeAndRebuild(network);
     },
@@ -256,7 +345,12 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return null;
       pushHistory();
       const edge = addEdge(network, fromId, toId);
-      // Keep imported/computed backend junction polygons stable.
+      if (edge) {
+        markDirtyEdge(edge.id);
+        markDirtyNode(fromId);
+        markDirtyNode(toId);
+  
+      }
       rebuildRenderable();
       return edge?.id ?? null;
     },
@@ -267,6 +361,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network.junctions.has(fromId)) return null;
       pushHistory();
       const toJunction = addJunction(network, toPos[0], toPos[1]);
+      markDirtyNode(toJunction.id);
       const edge = addEdge(network, fromId, toJunction.id);
       if (!edge) {
         rebuildRenderable();
@@ -275,6 +370,9 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       via.forEach((pt, idx) => {
         addEdgeGeometryPoint(network, edge.id, idx, pt);
       });
+      markDirtyEdge(edge.id);
+      markDirtyNode(fromId);
+
       rebuildRenderable();
       return edge.id;
     },
@@ -283,8 +381,14 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       const { network } = get();
       if (!network) return;
       pushHistory();
+      const edge = network.edges.get(id);
+      if (edge) {
+        markDirtyNode(edge.from);
+        markDirtyNode(edge.to);
+      }
+      markDirtyEdge(id);
+
       removeEdge(network, id);
-      // Keep junction polygons as imported/computed by backend.
       rebuildRenderable();
     },
 
@@ -295,9 +399,13 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       const edge = network.edges.get(id);
       const oldNumLanes = edge?.numLanes;
       setEdgeAttribute(network, id, attr, value);
-      // Edge attribute edits should not trigger TS junction-shape recomputation.
+      markDirtyEdge(id);
+      if (attr === "numLanes") {
+  
+        get().resetConnectionEdges.add(id);
+      }
       rebuildRenderable();
-      
+
       // Automatically trigger compute network (F5) when numLanes changes
       if (attr === "numLanes" && oldNumLanes !== undefined && oldNumLanes !== value) {
         get().doComputeNetwork();
@@ -309,6 +417,10 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       setLaneAttribute(network, id, attr, value);
+      // Find edge owning this lane
+      network.edges.forEach((edge) => {
+        if (edge.lanes.some((l) => l.id === id)) markDirtyEdge(edge.id);
+      });
       rebuildRenderable();
     },
 
@@ -317,6 +429,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       moveEdgeGeometryPoint(network, edgeId, pointIndex, pos);
+      markDirtyEdge(edgeId);
       rebuildRenderable();
     },
 
@@ -325,6 +438,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       addEdgeGeometryPoint(network, edgeId, afterIndex, pos);
+      markDirtyEdge(edgeId);
       rebuildRenderable();
     },
 
@@ -333,6 +447,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       removeEdgeGeometryPoint(network, edgeId, pointIndex);
+      markDirtyEdge(edgeId);
       rebuildRenderable();
     },
 
@@ -341,6 +456,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       addConnection(network, from, to, fromLane, toLane);
+      get().addedConnections.push({ from, to, fromLane, toLane });
       rebuildRenderable();
     },
 
@@ -349,6 +465,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (!network) return;
       pushHistory();
       removeConnection(network, from, to, fromLane, toLane);
+      get().removedConnections.push({ from, to, fromLane, toLane });
       rebuildRenderable();
     },
 
@@ -361,11 +478,11 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
 
       const oldType = junction.type;
       junction.type = type;
+      markDirtyNode(id);
 
       // If changing to traffic_light, generate a TLS program
       if (type === "traffic_light" && oldType !== "traffic_light") {
         const tls = generateTLSProgram(id, network);
-        // Update connections with tl reference
         let linkIdx = 0;
         for (const conn of network.connections) {
           const fromEdge = network.edges.get(conn.from);
@@ -374,11 +491,11 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
             conn.linkIndex = linkIdx++;
           }
         }
-        // Remove any existing TLS for this junction
         network.tlLogics = network.tlLogics.filter((t) => t.id !== id);
         network.tlLogics.push(tls);
+        markDirtyTLS(id);
+  
       } else if (type !== "traffic_light" && oldType === "traffic_light") {
-        // Remove TLS
         network.tlLogics = network.tlLogics.filter((t) => t.id !== id);
         for (const conn of network.connections) {
           if (conn.tl === id) {
@@ -386,6 +503,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
             conn.linkIndex = -1;
           }
         }
+        markDirtyTLS(id);
+  
       }
 
       recomputeAndRebuild(network);
@@ -402,6 +521,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (next === tls.offset) return;
       pushHistory();
       tls.offset = next;
+      markDirtyTLS(junctionId);
       rebuildRenderable();
     },
 
@@ -420,6 +540,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       phase.duration = next;
       if (phase.minDur !== undefined) phase.minDur = Math.min(phase.minDur, next);
       if (phase.maxDur !== undefined) phase.maxDur = Math.max(phase.maxDur, next);
+      markDirtyTLS(junctionId);
       rebuildRenderable();
     },
 
@@ -447,6 +568,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (normalized === phase.state) return;
       pushHistory();
       phase.state = normalized;
+      markDirtyTLS(junctionId);
       rebuildRenderable();
     },
 
@@ -463,6 +585,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         duration: 10,
         state: allRedState,
       });
+      markDirtyTLS(junctionId);
       rebuildRenderable();
     },
 
@@ -477,21 +600,50 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       if (phaseIndex < 0 || phaseIndex >= tls.phases.length) return;
       pushHistory();
       tls.phases.splice(phaseIndex, 1);
+      markDirtyTLS(junctionId);
       rebuildRenderable();
     },
 
     doComputeNetwork: async () => {
-      const { network, isComputing } = get();
+      const { network, isComputing, baseNetXML, dirtyNodes, dirtyEdges, dirtyTLS, resetConnectionEdges, addedConnections, removedConnections } = get();
       if (!network || isComputing) return;
       const snapshot = deepCloneNetwork(network);
-      const xml = exportNetXML(snapshot);
       set({ isComputing: true, computeError: null });
+
       try {
-        const computedXml = await computeViaNetconvert(xml);
+        const hasConnectionChanges = resetConnectionEdges.size > 0 || addedConnections.length > 0 || removedConnections.length > 0;
+        const hasDirty = dirtyNodes.size > 0 || dirtyEdges.size > 0 || hasConnectionChanges || dirtyTLS.size > 0;
+        let payload: {
+          baseNetXML: string;
+          nodXML?: string;
+          edgXML?: string;
+          conXML?: string;
+          tllXML?: string;
+        };
+
+        if (baseNetXML && hasDirty) {
+          // Patch mode: send base + only changed elements
+          payload = { baseNetXML };
+          const nodPatch = exportPatchNodXML(network, dirtyNodes);
+          const edgPatch = exportPatchEdgXML(network, dirtyEdges);
+          const tllPatch = exportPatchTllXML(network, dirtyTLS);
+          if (nodPatch) payload.nodXML = nodPatch;
+          if (edgPatch) payload.edgXML = edgPatch;
+          if (hasConnectionChanges) {
+            payload.conXML = exportPatchConXML(resetConnectionEdges, addedConnections, removedConnections, network);
+          }
+          if (tllPatch) payload.tllXML = tllPatch;
+        } else {
+          // Full mode: no base or nothing dirty — send full network
+          payload = { baseNetXML: exportNetXML(snapshot) };
+        }
+
+        const computedXml = await computeViaNetconvert(payload);
         const computedNetwork = parseNetXML(computedXml);
         pushSnapshot(snapshot);
         setCurrentNetwork(computedNetwork);
-        set({ isComputing: false, computeError: null });
+        set({ isComputing: false, computeError: null, baseNetXML: computedXml });
+        clearDirty();
       } catch (error: unknown) {
         const message =
           error instanceof Error ? error.message : "Failed to compute network via netconvert.";

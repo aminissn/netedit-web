@@ -1,7 +1,8 @@
 /**
- * Serializes a SUMONetwork back to net.xml format.
+ * Serializes a SUMONetwork back to net.xml format,
+ * and exports patch files (nod.xml, edg.xml, con.xml, tll.xml) for incremental netconvert.
  */
-import type { SUMONetwork } from "./types";
+import type { SUMONetwork, SUMOConnection } from "./types";
 
 const DEFAULT_SPREAD_TYPE = "right";
 
@@ -119,5 +120,168 @@ export function exportNetXML(network: SUMONetwork): string {
   }
 
   lines.push("</net>");
+  return lines.join("\n");
+}
+
+/**
+ * Export a .nod.xml patch containing only the specified dirty junctions.
+ */
+export function exportPatchNodXML(
+  network: SUMONetwork,
+  dirtyNodeIds: Set<string>
+): string | null {
+  if (dirtyNodeIds.size === 0) return null;
+  const lines: string[] = [];
+  lines.push('<?xml version="1.0" encoding="UTF-8"?>');
+  lines.push('<nodes>');
+  for (const id of Array.from(dirtyNodeIds)) {
+    const junc = network.junctions.get(id);
+    if (!junc) {
+      // Node was deleted — emit a delete directive
+      lines.push(`    <delete id="${escapeAttr(id)}"/>`);
+      continue;
+    }
+    const attrs = [
+      `id="${escapeAttr(junc.id)}"`,
+      `x="${junc.x.toFixed(2)}"`,
+      `y="${junc.y.toFixed(2)}"`,
+      `type="${junc.type}"`,
+    ];
+    if (junc.z !== 0) attrs.push(`z="${junc.z.toFixed(2)}"`);
+    lines.push(`    <node ${attrs.join(" ")}/>`);
+  }
+  lines.push('</nodes>');
+  return lines.join("\n");
+}
+
+/**
+ * Export a .edg.xml patch containing only the specified dirty edges.
+ */
+export function exportPatchEdgXML(
+  network: SUMONetwork,
+  dirtyEdgeIds: Set<string>
+): string | null {
+  if (dirtyEdgeIds.size === 0) return null;
+  const lines: string[] = [];
+  lines.push('<?xml version="1.0" encoding="UTF-8"?>');
+  lines.push('<edges>');
+  for (const id of Array.from(dirtyEdgeIds)) {
+    const edge = network.edges.get(id);
+    if (!edge) {
+      lines.push(`    <delete id="${escapeAttr(id)}"/>`);
+      continue;
+    }
+    const attrs = [
+      `id="${escapeAttr(edge.id)}"`,
+      `from="${escapeAttr(edge.from)}"`,
+      `to="${escapeAttr(edge.to)}"`,
+      `numLanes="${edge.numLanes}"`,
+      `speed="${edge.speed.toFixed(2)}"`,
+      `priority="${edge.priority}"`,
+      `spreadType="${DEFAULT_SPREAD_TYPE}"`,
+    ];
+    if (edge.type) attrs.push(`type="${escapeAttr(edge.type)}"`);
+    if (edge.allow) attrs.push(`allow="${escapeAttr(edge.allow)}"`);
+    if (edge.disallow) attrs.push(`disallow="${escapeAttr(edge.disallow)}"`);
+    if (edge.shape.length > 0) attrs.push(`shape="${shapeToString(edge.shape)}"`);
+    lines.push(`    <edge ${attrs.join(" ")}/>`);
+  }
+  lines.push('</edges>');
+  return lines.join("\n");
+}
+
+interface ConnectionEntry {
+  from: string;
+  to: string;
+  fromLane: number;
+  toLane: number;
+}
+
+/**
+ * Export a .con.xml patch containing only relevant changes:
+ * - All connections from and to edges whose numLanes changed (with both from and to edge IDs)
+ * - Explicitly added connections
+ * - Explicitly removed connections (with remove="true")
+ */
+export function exportPatchConXML(
+  resetEdges: Set<string>,
+  addedConnections: ConnectionEntry[],
+  removedConnections: ConnectionEntry[],
+  network: SUMONetwork
+): string {
+  const lines: string[] = [];
+  lines.push('<?xml version="1.0" encoding="UTF-8"?>');
+  lines.push('<connections>');
+
+  // Write all connections from and to edges with numLanes changes
+  // Each connection must contain both from and to edge IDs with reset="true"
+  const writtenConnections = new Set<string>();
+  for (const edgeId of Array.from(resetEdges)) {
+    // Find all connections FROM this edge
+    for (const conn of network.connections) {
+      if (conn.from === edgeId) {
+        const key = `${conn.from}-${conn.to}`;
+        if (!writtenConnections.has(key)) {
+          lines.push(`    <connection from="${escapeAttr(conn.from)}" to="${escapeAttr(conn.to)}" reset="true"/>`);
+          writtenConnections.add(key);
+        }
+      }
+    }
+    // Find all connections TO this edge
+    for (const conn of network.connections) {
+      if (conn.to === edgeId) {
+        const key = `${conn.from}-${conn.to}`;
+        if (!writtenConnections.has(key)) {
+          lines.push(`    <connection from="${escapeAttr(conn.from)}" to="${escapeAttr(conn.to)}" reset="true"/>`);
+          writtenConnections.add(key);
+        }
+      }
+    }
+  }
+
+  // Explicitly removed connections
+  for (const conn of removedConnections) {
+    lines.push(`    <connection from="${escapeAttr(conn.from)}" to="${escapeAttr(conn.to)}" fromLane="${conn.fromLane}" toLane="${conn.toLane}" remove="true"/>`);
+  }
+
+  // Explicitly added connections
+  for (const conn of addedConnections) {
+    lines.push(`    <connection from="${escapeAttr(conn.from)}" to="${escapeAttr(conn.to)}" fromLane="${conn.fromLane}" toLane="${conn.toLane}"/>`);
+  }
+
+  lines.push('</connections>');
+  return lines.join("\n");
+}
+
+/**
+ * Export a .tll.xml patch containing only the specified dirty TLS programs.
+ */
+export function exportPatchTllXML(
+  network: SUMONetwork,
+  dirtyTLSIds: Set<string>
+): string | null {
+  if (dirtyTLSIds.size === 0) return null;
+  const lines: string[] = [];
+  lines.push('<?xml version="1.0" encoding="UTF-8"?>');
+  lines.push('<tlLogics>');
+  for (const id of Array.from(dirtyTLSIds)) {
+    const tls = network.tlLogics.find((t) => t.id === id);
+    if (!tls) {
+      // TLS was removed — netconvert will handle based on junction type
+      lines.push(`    <delete id="${escapeAttr(id)}"/>`);
+      continue;
+    }
+    lines.push(
+      `    <tlLogic id="${escapeAttr(tls.id)}" type="${tls.type}" programID="${escapeAttr(tls.programID)}" offset="${tls.offset}">`
+    );
+    for (const phase of tls.phases) {
+      const pAttrs = [`duration="${phase.duration}"`, `state="${phase.state}"`];
+      if (phase.minDur !== undefined) pAttrs.push(`minDur="${phase.minDur}"`);
+      if (phase.maxDur !== undefined) pAttrs.push(`maxDur="${phase.maxDur}"`);
+      lines.push(`        <phase ${pAttrs.join(" ")}/>`);
+    }
+    lines.push("    </tlLogic>");
+  }
+  lines.push('</tlLogics>');
   return lines.join("\n");
 }

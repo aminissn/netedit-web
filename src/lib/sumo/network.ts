@@ -730,19 +730,53 @@ function computeLanes2Lanes(network: SUMONetwork): void {
       candidates.sort((a, b) => a.angle - b.angle);
 
       // Create connections: connect each incoming lane to appropriate outgoing lanes
-      // Only connect to the best matching outgoing edge(s) based on angle
-      // For straight-through connections, connect all lanes
-      // For turns, connect only the appropriate lanes
+      // Lane assignment rules:
+      // - Straight (small angle): rightmost to rightmost, leftmost to leftmost
+      // - Right turns: rightmost lanes
+      // - Left turns: leftmost lanes
+      // - U-turns (angle > 135°): leftmost lanes only
+      
       for (let fromLaneIdx = 0; fromLaneIdx < inEdge.numLanes; fromLaneIdx++) {
-        // Connect to the best matching outgoing edge (smallest angle)
+        // Connect to the best matching outgoing edge (smallest angle = straightest)
         if (candidates.length > 0) {
           const bestCandidate = candidates[0];
           const outEdge = bestCandidate.edge;
+          const angle = bestCandidate.angle;
           
-          // Determine which outgoing lane to connect to
-          // Rightmost lane connects to rightmost, leftmost to leftmost
-          const toLaneIdx = Math.min(fromLaneIdx, outEdge.numLanes - 1);
-          addConnection(network, inEdge.id, outEdge.id, fromLaneIdx, toLaneIdx);
+          // Determine which lanes should connect based on turn type
+          // In SUMO: lane 0 = rightmost, higher indices = leftmost
+          const isUTurn = angle > (Math.PI * 135 / 180); // > 135 degrees
+          const isLeftTurn = angle > (Math.PI * 45 / 180) && angle <= (Math.PI * 135 / 180); // 45-135 degrees
+          const isRightTurn = angle < (Math.PI * 45 / 180) && angle > (Math.PI * 10 / 180); // 10-45 degrees
+          const isStraight = angle <= (Math.PI * 10 / 180); // <= 10 degrees
+          
+          let shouldConnect = false;
+          let toLaneIdx = 0;
+          
+          if (isStraight) {
+            // Straight: connect corresponding lanes (rightmost to rightmost)
+            shouldConnect = true;
+            toLaneIdx = Math.min(fromLaneIdx, outEdge.numLanes - 1);
+          } else if (isRightTurn) {
+            // Right turn: connect rightmost lanes (lane 0, 1, etc.)
+            shouldConnect = fromLaneIdx < Math.min(inEdge.numLanes, 2); // Only rightmost 1-2 lanes
+            toLaneIdx = Math.min(fromLaneIdx, outEdge.numLanes - 1);
+          } else if (isLeftTurn) {
+            // Left turn: connect leftmost lanes (highest indices)
+            const leftmostLaneIdx = inEdge.numLanes - 1;
+            shouldConnect = fromLaneIdx >= leftmostLaneIdx - 1; // Leftmost 1-2 lanes
+            const leftmostToLaneIdx = outEdge.numLanes - 1;
+            toLaneIdx = Math.max(0, leftmostToLaneIdx - (leftmostLaneIdx - fromLaneIdx));
+          } else if (isUTurn) {
+            // U-turn: only leftmost lane (highest index)
+            const leftmostLaneIdx = inEdge.numLanes - 1;
+            shouldConnect = fromLaneIdx === leftmostLaneIdx;
+            toLaneIdx = outEdge.numLanes - 1; // Connect to leftmost lane of outgoing edge
+          }
+          
+          if (shouldConnect) {
+            addConnection(network, inEdge.id, outEdge.id, fromLaneIdx, toLaneIdx);
+          }
         }
         
         // Also connect to other good candidates if angle is small (straight connections)

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useRef } from "react";
+import React, { useRef, useState, useEffect } from "react";
 import { useNetworkStore } from "@/store/networkStore";
 
 export default function FileUpload() {
@@ -13,6 +13,29 @@ export default function FileUpload() {
   const computeError = useNetworkStore((s) => s.computeError);
   const clearComputeError = useNetworkStore((s) => s.clearComputeError);
   const network = useNetworkStore((s) => s.network);
+  const [showErrorDetails, setShowErrorDetails] = useState(false);
+  const errorDetailsRef = useRef<HTMLDivElement>(null);
+
+  // Close error details when clicking outside
+  useEffect(() => {
+    if (!showErrorDetails) return;
+    
+    const handleClickOutside = (event: MouseEvent) => {
+      if (errorDetailsRef.current && !errorDetailsRef.current.contains(event.target as Node)) {
+        setShowErrorDetails(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showErrorDetails]);
+
+  // Close error details when error is cleared
+  useEffect(() => {
+    if (!computeError) {
+      setShowErrorDetails(false);
+    }
+  }, [computeError]);
 
   const handleFileOpen = () => {
     fileInputRef.current?.click();
@@ -91,13 +114,30 @@ export default function FileUpload() {
         </button>
       )}
       {computeError && (
-        <button
-          onClick={clearComputeError}
-          className="px-3 py-1.5 bg-red-700/90 text-red-100 rounded-lg text-sm hover:bg-red-600 backdrop-blur-sm shadow max-w-[360px] truncate"
-          title={computeError}
-        >
-          netconvert error: {computeError}
-        </button>
+        <div className="relative" ref={errorDetailsRef}>
+          <button
+            onClick={() => setShowErrorDetails(!showErrorDetails)}
+            className="px-3 py-1.5 bg-red-700/90 text-red-100 rounded-lg text-sm hover:bg-red-600 backdrop-blur-sm shadow"
+          >
+            netconvert error {showErrorDetails ? "▼" : "▶"}
+          </button>
+          {showErrorDetails && (
+            <div className="absolute top-full left-0 mt-2 w-[600px] max-h-[400px] overflow-auto bg-gray-900/95 border border-red-700 rounded-lg p-4 text-xs text-red-100 shadow-xl z-50 backdrop-blur-sm">
+              <div className="flex justify-between items-start mb-2">
+                <span className="font-semibold text-red-300">Full Error Details:</span>
+                <button
+                  onClick={clearComputeError}
+                  className="px-2 py-1 bg-red-800/80 hover:bg-red-700 rounded text-xs"
+                >
+                  Close
+                </button>
+              </div>
+              <pre className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed">
+                {computeError}
+              </pre>
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
