@@ -124,11 +124,164 @@ export function exportNetXML(network: SUMONetwork): string {
 }
 
 /**
+ * Extract a sub-network around the given dirty edges/nodes.
+ * Includes:
+ * - All dirty edges and their from/to nodes
+ * - All dirty nodes
+ * - All other edges connected to any of those nodes (+ their from/to nodes)
+ * - Connections that involve any of the included edges
+ * - TL logics for any included junctions
+ *
+ * Returns a standalone net.xml suitable for netconvert processing.
+ */
+export function extractSubNetwork(
+  network: SUMONetwork,
+  dirtyEdges: Set<string>,
+  dirtyNodes: Set<string>
+): { xml: string; nodeIds: Set<string>; edgeIds: Set<string> } {
+  // Step 1: Collect seed nodes from dirty edges and dirty nodes
+  const nodeIds = new Set<string>(dirtyNodes);
+  for (const edgeId of Array.from(dirtyEdges)) {
+    const edge = network.edges.get(edgeId);
+    if (edge) {
+      nodeIds.add(edge.from);
+      nodeIds.add(edge.to);
+    }
+  }
+
+  // Step 2: Collect ALL edges connected to any seed node (1-hop neighborhood)
+  const edgeIds = new Set<string>(dirtyEdges);
+  network.edges.forEach((edge) => {
+    if (nodeIds.has(edge.from) || nodeIds.has(edge.to)) {
+      edgeIds.add(edge.id);
+    }
+  });
+
+  // Step 3: Expand nodes to include from/to of all collected edges
+  for (const edgeId of Array.from(edgeIds)) {
+    const edge = network.edges.get(edgeId);
+    if (edge) {
+      nodeIds.add(edge.from);
+      nodeIds.add(edge.to);
+    }
+  }
+
+  // Step 4: Build sub-network XML
+  const lines: string[] = [];
+  lines.push('<?xml version="1.0" encoding="UTF-8"?>');
+  lines.push("");
+  lines.push(
+    `<net version="1.16" spreadType="${DEFAULT_SPREAD_TYPE}" junctionCornerDetail="5" limitTurnSpeed="5.50" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/net_file.xsd">`
+  );
+  lines.push("");
+
+  // Location (same as full network)
+  const loc = network.location;
+  lines.push(
+    `    <location netOffset="${loc.netOffset[0].toFixed(2)},${loc.netOffset[1].toFixed(2)}" convBoundary="${loc.convBoundary.map((v) => v.toFixed(2)).join(",")}" origBoundary="${loc.origBoundary.map((v) => v.toFixed(6)).join(",")}" projParameter="${escapeAttr(loc.projParameter)}"/>`
+  );
+  lines.push("");
+
+  // Edges
+  for (const edgeId of Array.from(edgeIds)) {
+    const edge = network.edges.get(edgeId);
+    if (!edge) continue;
+    const attrs = [
+      `id="${escapeAttr(edge.id)}"`,
+      `from="${escapeAttr(edge.from)}"`,
+      `to="${escapeAttr(edge.to)}"`,
+      `priority="${edge.priority}"`,
+    ];
+    if (edge.type) attrs.push(`type="${escapeAttr(edge.type)}"`);
+    if (edge.numLanes > 1) attrs.push(`numLanes="${edge.numLanes}"`);
+    if (edge.speed !== 13.89) attrs.push(`speed="${edge.speed.toFixed(2)}"`);
+    attrs.push(`spreadType="${DEFAULT_SPREAD_TYPE}"`);
+    if (edge.shape.length > 0) attrs.push(`shape="${shapeToString(edge.shape)}"`);
+    lines.push(`    <edge ${attrs.join(" ")}>`);
+    for (const lane of edge.lanes) {
+      const lAttrs = [
+        `id="${escapeAttr(lane.id)}"`,
+        `index="${lane.index}"`,
+        `speed="${lane.speed.toFixed(2)}"`,
+        `length="${lane.length.toFixed(2)}"`,
+        `width="${lane.width.toFixed(2)}"`,
+      ];
+      if (lane.allow) lAttrs.push(`allow="${escapeAttr(lane.allow)}"`);
+      if (lane.disallow) lAttrs.push(`disallow="${escapeAttr(lane.disallow)}"`);
+      if (lane.shape.length > 0) lAttrs.push(`shape="${shapeToString(lane.shape)}"`);
+      lines.push(`        <lane ${lAttrs.join(" ")}/>`);
+    }
+    lines.push("    </edge>");
+  }
+  lines.push("");
+
+  // TL logics for included junctions
+  for (const tl of network.tlLogics) {
+    if (nodeIds.has(tl.id)) {
+      lines.push(
+        `    <tlLogic id="${escapeAttr(tl.id)}" type="${tl.type}" programID="${escapeAttr(tl.programID)}" offset="${tl.offset}">`
+      );
+      for (const phase of tl.phases) {
+        const pAttrs = [`duration="${phase.duration}"`, `state="${phase.state}"`];
+        if (phase.minDur !== undefined) pAttrs.push(`minDur="${phase.minDur}"`);
+        if (phase.maxDur !== undefined) pAttrs.push(`maxDur="${phase.maxDur}"`);
+        lines.push(`        <phase ${pAttrs.join(" ")}/>`);
+      }
+      lines.push("    </tlLogic>");
+    }
+  }
+  lines.push("");
+
+  // Junctions
+  for (const nodeId of Array.from(nodeIds)) {
+    const junc = network.junctions.get(nodeId);
+    if (!junc) continue;
+    const attrs = [
+      `id="${escapeAttr(junc.id)}"`,
+      `type="${junc.type}"`,
+      `x="${junc.x.toFixed(2)}"`,
+      `y="${junc.y.toFixed(2)}"`,
+    ];
+    if (junc.z !== 0) attrs.push(`z="${junc.z.toFixed(2)}"`);
+    if (junc.incLanes.length > 0) attrs.push(`incLanes="${junc.incLanes.join(" ")}"`);
+    if (junc.intLanes.length > 0) attrs.push(`intLanes="${junc.intLanes.join(" ")}"`);
+    if (junc.shape.length > 0) attrs.push(`shape="${shapeToString(junc.shape)}"`);
+    lines.push(`    <junction ${attrs.join(" ")}/>`);
+  }
+  lines.push("");
+
+  // Connections involving included edges
+  for (const conn of network.connections) {
+    if (edgeIds.has(conn.from) || edgeIds.has(conn.to)) {
+      // Only include if both edges are in the sub-network
+      if (edgeIds.has(conn.from) && edgeIds.has(conn.to)) {
+        const attrs = [
+          `from="${escapeAttr(conn.from)}"`,
+          `to="${escapeAttr(conn.to)}"`,
+          `fromLane="${conn.fromLane}"`,
+          `toLane="${conn.toLane}"`,
+        ];
+        if (conn.via) attrs.push(`via="${escapeAttr(conn.via)}"`);
+        if (conn.tl) attrs.push(`tl="${escapeAttr(conn.tl)}"`);
+        if (conn.linkIndex >= 0) attrs.push(`linkIndex="${conn.linkIndex}"`);
+        if (conn.dir) attrs.push(`dir="${conn.dir}"`);
+        if (conn.state) attrs.push(`state="${conn.state}"`);
+        lines.push(`    <connection ${attrs.join(" ")}/>`);
+      }
+    }
+  }
+  lines.push("");
+
+  lines.push("</net>");
+  return { xml: lines.join("\n"), nodeIds, edgeIds };
+}
+
+/**
  * Merge two patch XML files by combining their content.
  * Removes duplicates (keeps the latest version of each element).
  * For connections (which don't have IDs), uses a composite key.
  */
-function mergePatchXML(existingXML: string | null, newXML: string | null, rootTag: string): string | null {
+export function mergePatchXML(existingXML: string | null, newXML: string | null, rootTag: string): string | null {
   if (!newXML) return existingXML;
   if (!existingXML) return newXML;
 
@@ -346,6 +499,56 @@ export function exportPatchConXML(
   lines.push('</connections>');
   const newXML = lines.join("\n");
   return mergePatchXML(existingPatchXML, newXML, "connections") || newXML;
+}
+
+/**
+ * Export a .con.xml containing only connections that exist in computedNetwork
+ * but not in baseNetwork. Used to pass newly computed connections back to netconvert
+ * for TLS regeneration.
+ */
+export function exportNewConnectionsXML(
+  baseNetwork: SUMONetwork,
+  computedNetwork: SUMONetwork
+): string | null {
+  // Build a set of connection keys from base network
+  const baseConnKeys = new Set<string>();
+  for (const conn of baseNetwork.connections) {
+    const key = `${conn.from}:${conn.fromLane}-${conn.to}:${conn.toLane}`;
+    baseConnKeys.add(key);
+  }
+
+  // Find connections in computed that aren't in base
+  const newConnections: SUMOConnection[] = [];
+  for (const conn of computedNetwork.connections) {
+    const key = `${conn.from}:${conn.fromLane}-${conn.to}:${conn.toLane}`;
+    if (!baseConnKeys.has(key)) {
+      newConnections.push(conn);
+    }
+  }
+
+  if (newConnections.length === 0) return null;
+
+  const lines: string[] = [];
+  lines.push('<?xml version="1.0" encoding="UTF-8"?>');
+  lines.push("<connections>");
+
+  for (const conn of newConnections) {
+    const attrs = [
+      `from="${escapeAttr(conn.from)}"`,
+      `to="${escapeAttr(conn.to)}"`,
+      `fromLane="${conn.fromLane}"`,
+      `toLane="${conn.toLane}"`,
+    ];
+    if (conn.via) attrs.push(`via="${escapeAttr(conn.via)}"`);
+    if (conn.tl) attrs.push(`tl="${escapeAttr(conn.tl)}"`);
+    if (conn.linkIndex >= 0) attrs.push(`linkIndex="${conn.linkIndex}"`);
+    if (conn.dir) attrs.push(`dir="${conn.dir}"`);
+    if (conn.state) attrs.push(`state="${escapeAttr(conn.state)}"`);
+    lines.push(`    <connection ${attrs.join(" ")}/>`);
+  }
+
+  lines.push("</connections>");
+  return lines.join("\n");
 }
 
 /**

@@ -21,10 +21,13 @@ import {
 import { generateTLSProgram } from "@/lib/sumo/tlsGenerate";
 import {
   exportNetXML,
+  extractSubNetwork,
   exportPatchNodXML,
   exportPatchEdgXML,
   exportPatchConXML,
   exportPatchTllXML,
+  exportNewConnectionsXML,
+  mergePatchXML,
 } from "@/lib/sumo/exporter";
 import { createProjection, type Projection } from "@/lib/sumo/projection";
 
@@ -72,8 +75,10 @@ interface NetworkState {
   computeError: string | null;
   networkVersion: number; // Increment on mutations to trigger React re-renders
 
-  /** The last-computed (or initially-loaded) net.xml, used as base for patch-mode netconvert. */
+  /** The last-computed (or initially-loaded) net.xml string, used as base for full-network netconvert. */
   baseNetXML: string | null;
+  /** Parsed snapshot of the base network, used for sub-network extraction (avoids re-parsing baseNetXML). */
+  baseNetwork: SUMONetwork | null;
   /** Accumulated patch files that persist across multiple compute operations */
   accumulatedPatches: {
     nodXML: string | null;
@@ -275,6 +280,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
     isComputing: false,
     computeError: null,
     baseNetXML: null,
+    baseNetwork: null,
     networkVersion: 0,
     accumulatedPatches: {
       nodXML: null,
@@ -300,6 +306,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         historyIndex: 0,
         computeError: null,
         baseNetXML: xml,
+        baseNetwork: deepCloneNetwork(network),
         accumulatedPatches: {
           nodXML: null,
           edgXML: null,
@@ -326,6 +333,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
         historyIndex: 0,
         computeError: null,
         baseNetXML: xml,
+        baseNetwork: deepCloneNetwork(network),
         accumulatedPatches: {
           nodXML: null,
           edgXML: null,
@@ -756,7 +764,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
     },
 
     doComputeNetwork: async () => {
-      const { network, isComputing, baseNetXML, accumulatedPatches, dirtyNodes, dirtyEdges, dirtyTLS, resetConnectionEdges, resetConnectionSnapshots, addedConnections, removedConnections } = get();
+      const { network, isComputing, baseNetwork, dirtyNodes, dirtyEdges, dirtyTLS,
+              resetConnectionEdges, resetConnectionSnapshots, addedConnections, removedConnections } = get();
       if (!network || isComputing) return;
       const snapshot = deepCloneNetwork(network);
       set({ isComputing: true, computeError: null });
@@ -764,63 +773,142 @@ export const useNetworkStore = create<NetworkState>((set, get) => {
       try {
         const hasConnectionChanges = resetConnectionEdges.size > 0 || addedConnections.length > 0 || removedConnections.length > 0;
         const hasDirty = dirtyNodes.size > 0 || dirtyEdges.size > 0 || hasConnectionChanges || dirtyTLS.size > 0;
-        let payload: {
-          baseNetXML: string;
-          nodXML?: string;
-          edgXML?: string;
-          conXML?: string;
-          tllXML?: string;
-        };
-        let newPatches = { ...accumulatedPatches };
 
-        if (baseNetXML) {
-          // Always use the original uploaded file as base when it exists
-          if (hasDirty) {
-            // Patch mode: send original base + only changed elements (merged with existing patches)
-            payload = { baseNetXML };
-            const nodPatch = exportPatchNodXML(network, dirtyNodes, accumulatedPatches.nodXML);
-            const edgPatch = exportPatchEdgXML(network, dirtyEdges, accumulatedPatches.edgXML);
-            const tllPatch = exportPatchTllXML(network, dirtyTLS, accumulatedPatches.tllXML);
-            if (nodPatch) {
-              payload.nodXML = nodPatch;
-              newPatches.nodXML = nodPatch;
+        if (hasDirty && baseNetwork) {
+          // ── Sub-network mode ──
+          // 1. Collect all affected node IDs (dirty nodes + endpoints of dirty edges + TLS nodes)
+          const allDirtyNodes = new Set<string>(dirtyNodes);
+          for (const edgeId of Array.from(dirtyEdges)) {
+            const edge = network.edges.get(edgeId);
+            if (edge) {
+              allDirtyNodes.add(edge.from);
+              allDirtyNodes.add(edge.to);
             }
-            if (edgPatch) {
-              payload.edgXML = edgPatch;
-              newPatches.edgXML = edgPatch;
-            }
-            if (hasConnectionChanges) {
-              const conPatch = exportPatchConXML(resetConnectionEdges, resetConnectionSnapshots, addedConnections, removedConnections, network, accumulatedPatches.conXML);
-              payload.conXML = conPatch;
-              newPatches.conXML = conPatch;
-            }
-            if (tllPatch) {
-              payload.tllXML = tllPatch;
-              newPatches.tllXML = tllPatch;
-            }
-          } else {
-            // No changes: just use the original base file (no patches)
-            payload = { baseNetXML };
           }
-        } else {
-          // Full mode: no original base (new network) — send full network
-          payload = { baseNetXML: exportNetXML(snapshot) };
-          // Reset patches for new network
-          newPatches = {
-            nodXML: null,
-            edgXML: null,
-            conXML: null,
-            tllXML: null,
+          for (const tlsId of Array.from(dirtyTLS)) {
+            allDirtyNodes.add(tlsId);
+          }
+
+          // 2. Extract the sub-network BASE from baseNetwork (last committed state)
+          const { xml: subBaseXml, nodeIds: subNodeIds, edgeIds: subEdgeIds } =
+            extractSubNetwork(baseNetwork, dirtyEdges, allDirtyNodes);
+
+          // 3. Generate patch files from the current (dirty) in-memory network
+          //    These describe what changed relative to baseNetwork
+          const subDirtyNodes = new Set(Array.from(dirtyNodes).filter((id) => subNodeIds.has(id)));
+          const subDirtyEdges = new Set(Array.from(dirtyEdges).filter((id) => subEdgeIds.has(id)));
+          const subDirtyTLS = new Set(Array.from(dirtyTLS).filter((id) => subNodeIds.has(id)));
+
+          const payload: {
+            baseNetXML: string;
+            nodXML?: string;
+            edgXML?: string;
+            conXML?: string;
+            tllXML?: string;
+          } = { baseNetXML: subBaseXml };
+
+          const nodPatch = exportPatchNodXML(network, subDirtyNodes);
+          const edgPatch = exportPatchEdgXML(network, subDirtyEdges);
+          const tllPatch = exportPatchTllXML(network, subDirtyTLS);
+          if (nodPatch) payload.nodXML = nodPatch;
+          if (edgPatch) payload.edgXML = edgPatch;
+          if (hasConnectionChanges) {
+            const conPatch = exportPatchConXML(resetConnectionEdges, resetConnectionSnapshots, addedConnections, removedConnections, network);
+            payload.conXML = conPatch;
+          }
+          if (tllPatch) payload.tllXML = tllPatch;
+
+          // 4. Send sub-network base + patches to netconvert (Pass 1)
+          const computedXml = await computeViaNetconvert(payload);
+          let computedSub = parseNetXML(computedXml);
+
+          // 5. Check for new connections and call netconvert again if needed
+          // Filter baseNetwork connections to only those in the sub-network area for comparison
+          const baseSubConnections = baseNetwork.connections.filter((conn) => {
+            return subEdgeIds.has(conn.from) || subEdgeIds.has(conn.to);
+          });
+          const baseSubNetwork: SUMONetwork = {
+            ...baseNetwork,
+            connections: baseSubConnections,
           };
+          const newConnXML = exportNewConnectionsXML(baseSubNetwork, computedSub);
+          if (newConnXML) {
+            // Pass 2: Call netconvert again with the same base + patches + new connections
+            // Merge new connections with any existing conXML in the payload
+            const mergedConXML = payload.conXML
+              ? mergePatchXML(payload.conXML, newConnXML, "connections")
+              : newConnXML;
+            if (mergedConXML) {
+              const pass2Payload = { ...payload, conXML: mergedConXML };
+              const pass2Xml = await computeViaNetconvert(pass2Payload);
+              computedSub = parseNetXML(pass2Xml);
+            }
+          }
+
+          // 6. Merge results back: only update elements in the sub-network
+          pushSnapshot(snapshot);
+
+          // Update junctions
+          computedSub.junctions.forEach((computedJunc, jId) => {
+            const existing = network.junctions.get(jId);
+            if (!existing) return;
+            existing.shape = computedJunc.shape;
+            existing.incLanes = computedJunc.incLanes;
+            existing.intLanes = computedJunc.intLanes;
+          });
+
+          // Update edges + lane shapes
+          computedSub.edges.forEach((computedEdge, eId) => {
+            const existing = network.edges.get(eId);
+            if (!existing) return;
+            existing.shape = computedEdge.shape;
+            existing.priority = computedEdge.priority;
+            // Replace lanes entirely to handle numLanes changes
+            existing.lanes = computedEdge.lanes;
+            existing.numLanes = computedEdge.numLanes;
+          });
+
+          // Update connections: remove old ones whose from-edge is in sub-network, add computed
+          network.connections = network.connections.filter((conn) => {
+            return !subEdgeIds.has(conn.from);
+          });
+          for (const conn of computedSub.connections) {
+            if (network.edges.has(conn.from) && network.edges.has(conn.to)) {
+              network.connections.push(conn);
+            }
+          }
+
+          // Update TL logics for sub-network junctions
+          for (const computedTl of computedSub.tlLogics) {
+            if (subNodeIds.has(computedTl.id)) {
+              const idx = network.tlLogics.findIndex((t) => t.id === computedTl.id);
+              if (idx >= 0) {
+                network.tlLogics[idx] = computedTl;
+              } else {
+                network.tlLogics.push(computedTl);
+              }
+            }
+          }
+
+          setCurrentNetwork(network);
+        } else {
+          // No dirty elements or no baseNetwork: full network compute (e.g., initial load)
+          const fullXml = exportNetXML(snapshot);
+          const computedXml = await computeViaNetconvert({ baseNetXML: fullXml });
+          const computedNetwork = parseNetXML(computedXml);
+          pushSnapshot(snapshot);
+          setCurrentNetwork(computedNetwork);
         }
 
-        const computedXml = await computeViaNetconvert(payload);
-        const computedNetwork = parseNetXML(computedXml);
-        pushSnapshot(snapshot);
-        setCurrentNetwork(computedNetwork);
-        // Keep baseNetXML unchanged - it should always be the original uploaded file
-        // Update accumulated patches for next compute
-        set({ isComputing: false, computeError: null, accumulatedPatches: newPatches });
+        // ── Rolling base: update baseNetXML and baseNetwork to current state ──
+        const updatedBaseXML = exportNetXML(network);
+        set({
+          isComputing: false,
+          computeError: null,
+          baseNetXML: updatedBaseXML,
+          baseNetwork: deepCloneNetwork(network),
+          accumulatedPatches: { nodXML: null, edgXML: null, conXML: null, tllXML: null },
+        });
         clearDirty();
       } catch (error: unknown) {
         const message =
